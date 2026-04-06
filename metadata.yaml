@@ -1,0 +1,7 @@
+name: astrbot_plugin_gossip_sharer
+desc: 全能消息转发与告状工具，支持跨 Session 投递。
+help: 珈宝专用传话筒。支持工具：send_cross_message, get_available_groups
+version: 1.1.0
+author: 珈百璃
+priority: 10
+enabled: true

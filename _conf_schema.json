@@ -1,0 +1,24 @@
+{
+    "default_platform": {
+        "type": "string",
+        "default": "1207797855",
+        "description": "默认平台 ID"
+    },
+    "sister_qq": {
+        "type": "string",
+        "default": "1716358835",
+        "description": "姐姐的 QQ 号"
+    },
+    "group_whitelist": {
+        "type": "list",
+        "default": [
+            "984252223"
+        ],
+        "description": "允许转发消息的群号列表"
+    },
+    "guarantee_threshold": {
+        "type": "int",
+        "default": 5,
+        "description": "保底阈值（连续多少次没打报告后强制触发告状冲动）"
+    }
+}
