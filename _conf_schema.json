@@ -2,7 +2,7 @@
     "default_platform": {
         "type": "string",
         "default": "1207797855",
-        "description": "默认平台 ID"
+        "description": "默认平台 ID。不填写时使用内置默认值 1207797855"
     },
     "sister_qq": {
         "type": "string",
@@ -14,7 +14,7 @@
         "default": [
             "984252223"
         ],
-        "description": "允许转发消息的群号列表"
+        "description": "额外允许转发消息的群号列表，会与 soft_whitelist 的 group_whitelist 合并"
     },
     "guarantee_threshold": {
         "type": "int",

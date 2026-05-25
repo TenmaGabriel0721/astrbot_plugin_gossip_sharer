@@ -1,83 +1,66 @@
-# 珈百璃的跨界传声筒 (Gossip Sharer)
+# astrbot_plugin_gossip_sharer
 
-✨ **让珈宝帮你跨界传话、打小报告的万能工具！**
+基于 AstrBot 的跨 Session 消息转发插件，支持跨平台、跨群组、跨私聊投递，并可把转发内容写入目标会话上下文。
 
-基于 AstrBot 的跨 Session 消息转发插件，支持跨平台、跨群组、跨私聊的消息投递。
+## 核心功能
 
-## 🌟 核心功能
+- **跨会话转发**：通过 `send_cross_message` 工具向私聊或群聊发送消息。
+- **私聊目标不限制**：`FriendMessage` 目标不做白名单限制。
+- **群聊白名单**：`GroupMessage` 目标必须在群白名单内。
+- **软白名单联动**：自动读取 `astrbot_plugin_soft_whitelist_config.json` 的 `group_whitelist`，并与本插件配置的 `group_whitelist` 合并去重。
+- **保底提示**：连续多次没有主动转发后，在 LLM 请求阶段注入提示，让模型自行判断是否调用 `send_cross_message`。
+- **列表查询**：支持尝试读取群列表和好友列表；平台不支持时返回降级说明。
 
-- **跨界转发**：通过 `send_cross_message` 工具，珈宝可以把话带给任何人或群。
-- **姐姐专属**：内置“给姐姐打小报告”快捷逻辑，受了委屈、发现好玩的秒传达。
-- **安全白名单**：群聊转发受白名单保护，防止珈宝在不该说话的地方乱发。
-- **保底提示**：连续多次没有主动转发后，会向 Bot 注入一条提示，提醒它按正常方式考虑是否调用 `send_cross_message` 给姐姐分享最近内容。
-- **好友感知**：支持通过 `get_friend_list` 尝试读取 Bot 当前平台可用的好友列表；若平台不支持，则自动降级为说明文本。
-- **环境感知**：支持查询当前可用的群聊白名单。
-
-## ⚙️ 配置项
+## 配置项
 
 在 `_conf_schema.json` 或 Web 面板中配置：
 
 | 配置项 | 类型 | 描述 |
 | :--- | :--- | :--- |
-| `default_platform` | string | 默认平台 ID (通常是 OneBot ID) |
-| `sister_qq` | string | 姐姐的 QQ 号 (告状和保底提示的首选目标) |
-| `group_whitelist` | list | 允许转发消息的群号列表 |
-| `guarantee_threshold` | int | 保底阈值（连续多少次未触发主动转发后，注入一次“考虑给姐姐分享内容”的提示） |
+| `default_platform` | string | 默认平台 ID；不填写时使用内置默认值 `1207797855` |
+| `sister_qq` | string | 姐姐的 QQ 号，作为告状和保底提示的首选私聊目标 |
+| `group_whitelist` | list | 额外允许转发消息的群号列表，会与软白名单插件的群白名单合并 |
+| `guarantee_threshold` | int | 连续多少次 LLM 请求未成功转发后，注入一次保底提示；小于等于 0 表示关闭 |
 
-> 当前版本统一使用 AstrBot 传入配置，不再额外读取本地 `config.json`，以避免与 Web 面板配置冲突。
-
-## 🛠️ 工具说明
+## 工具说明
 
 ### `send_cross_message`
+
 向指定私聊或群聊发送消息。
 
-- **target_type**: `FriendMessage` (私聊) 或 `GroupMessage` (群聊)
-- **target_id**: 目标 QQ 或群号
-- **content**: 消息内容
-- **target_platform**: (可选) 目标平台，默认使用 `default_platform`
+- `target_type`: `FriendMessage` 或 `GroupMessage`
+- `target_id`: 目标 QQ 或群号
+- `content`: 消息内容
+- `target_platform`: 可选，目标平台，默认使用 `default_platform`
 
-> 注意：当 `target_type` 为 `GroupMessage` 时，目标群必须位于 `group_whitelist` 中。
+当 `target_type` 为 `GroupMessage` 时，目标群必须在合并后的群白名单中；`FriendMessage` 不受该限制。
 
 ### `get_available_groups`
-获取当前允许转发消息的群聊白名单列表。
+
+获取 Bot 当前可感知到的群聊列表，并标注哪些群在白名单中可用于转发。若平台无法读取群列表，则返回已配置的群白名单。
 
 ### `get_friend_list`
-尝试获取当前 Bot 所在平台支持的好友列表。
 
-- 如果平台实现了好友列表接口，则返回好友信息
-- 如果平台未实现，则返回降级提示文本
-- 姐姐 QQ (`sister_qq`) 始终可作为默认私聊目标参考
+尝试获取当前 Bot 所在平台支持的好友列表。若平台未实现好友列表接口，则返回降级提示，`sister_qq` 仍可作为默认私聊目标参考。
 
-## 🤖 自动保底逻辑
+## 自动保底逻辑
 
-插件会在装饰结果阶段统计“未发生主动转发”的次数：
+插件会在 LLM 请求阶段统计未发生主动转发的次数：
 
-- 每次事件经过该阶段时，计数 +1
-- 只要调用 `send_cross_message` 成功发送，计数就会清零
-- 当计数达到 `guarantee_threshold` 时：
-  - 不会直接替 Bot 发消息
-  - 而是返回一条提示文本
-  - 提醒 Bot 按正常流程考虑是否调用 `send_cross_message`
-  - 如果 Bot 判断当前上下文值得分享，就可以自然地给姐姐打小报告
+- 每次 LLM 请求计数 +1
+- `send_cross_message` 成功发送后计数清零
+- 达到 `guarantee_threshold` 时，把提示追加到 `system_prompt`
+- 提示只引导模型考虑是否分享，不会直接替模型发送消息
 
-也就是说，保底机制只负责“提醒 Bot 去考虑调用工具”，不直接代替 Bot 执行分享。
-
-## 📦 安装
+## 安装
 
 1. 将插件文件夹放入 `data/plugins/`
 2. 重载插件或重启 AstrBot
-3. 在 Web 面板中配置：
-   - 默认平台 ID
-   - 姐姐 QQ
-   - 群白名单
-   - 保底阈值
+3. 在 Web 面板中配置默认平台、姐姐 QQ、额外群白名单和保底阈值
 
-## 📌 当前实现说明
+## 当前实现说明
 
-- 好友列表能力依赖具体平台适配器是否提供接口
-- 群消息转发受白名单约束
+- 群白名单读取使用 `utf-8-sig`，可兼容带 BOM 的 AstrBot 配置文件
+- 软白名单配置缺失或读取失败时，会继续使用本插件配置的 `group_whitelist`
 - 私聊消息默认不做白名单限制
-- 保底机制默认引导 Bot 优先考虑向 `sister_qq` 分享内容
-
----
-*Created with ❤️ by 珈百璃*
+- 保底机制默认引导模型优先考虑向 `sister_qq` 分享内容

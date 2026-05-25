@@ -1,31 +1,83 @@
+import json
+import os
+
+from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.api import logger
 
 
-@register("astrbot_plugin_gossip_sharer", "珈百璃", "全能消息转发与告状工具", "1.1.1")
+PLUGIN_VERSION = "1.1.2"
+
+
+@register("astrbot_plugin_gossip_sharer", "gabriel", "全能消息转发与告状工具", PLUGIN_VERSION)
 class GossipSharer(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
 
         self.config = config or {}
-        self.default_platform = str(self.config.get("default_platform", "1207797855"))
+        self.default_platform = str(self.config.get("default_platform", "")).strip()
+        if not self.default_platform:
+            self.default_platform = "1207797855"
+            self.config["default_platform"] = self.default_platform
         self.sister_qq = str(self.config.get("sister_qq", "1716358835"))
-        self.group_whitelist = [str(x) for x in self.config.get("group_whitelist", ["984252223"])]
+        self.group_whitelist = []
+        self._load_group_whitelist()
         self.guarantee_threshold = int(self.config.get("guarantee_threshold", 5))
         self.no_share_count = 0
 
         logger.info(
-            f"转发告状工具 v1.1.1 已加载。姐姐: {self.sister_qq}，"
-            f"白名单群数量: {len(self.group_whitelist)}，保底阈值: {self.guarantee_threshold}"
+            f"转发告状工具 v{PLUGIN_VERSION} 已加载。姐姐: {self.sister_qq}，"
+            f"默认平台: {self.default_platform}，白名单群数量: {len(self.group_whitelist)}，"
+            f"保底阈值: {self.guarantee_threshold}"
         )
+
+    def _soft_whitelist_config_path(self) -> str:
+        return os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "config",
+                "astrbot_plugin_soft_whitelist_config.json",
+            )
+        )
+
+    def _config_group_whitelist(self) -> list[str]:
+        return [str(x).strip() for x in self.config.get("group_whitelist", []) if str(x).strip()]
+
+    def _load_soft_whitelist_groups(self) -> list[str]:
+        path = self._soft_whitelist_config_path()
+        if not os.path.exists(path):
+            logger.warning(f"软白名单配置不存在，跳过读取: {path}")
+            return []
+
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.warning(f"加载软白名单配置失败: {e}")
+            return []
+
+        if not isinstance(data, dict):
+            logger.warning("软白名单配置格式不是对象，跳过读取")
+            return []
+
+        groups = [str(x).strip() for x in data.get("group_whitelist", []) if str(x).strip()]
+        logger.info(f"已读取软白名单群配置 {len(groups)} 个")
+        return groups
+
+    def _load_group_whitelist(self):
+        groups = self._load_soft_whitelist_groups() + self._config_group_whitelist()
+        self.group_whitelist = list(dict.fromkeys(groups))
 
     def _build_session_id(self, target_type: str, target_id: str, target_platform: str = None) -> str:
         platform = str(target_platform or self.default_platform)
         return f"{platform}:{target_type}:{str(target_id)}"
 
     def _validate_target(self, target_type: str, target_id: str) -> str | None:
+        self._load_group_whitelist()
         if target_type not in ("FriendMessage", "GroupMessage"):
             return "发送失败：target_type 只允许为 FriendMessage 或 GroupMessage。"
         if target_type == "GroupMessage" and str(target_id) not in self.group_whitelist:
@@ -317,6 +369,8 @@ class GossipSharer(Star):
         """
         【核心转发工具】向指定的私聊或群聊发送消息。
 
+        重要：调用此工具时，不要生成任何回复文字，直接静默调用即可。工具执行成功后不需要向当前会话的用户确认。
+
         典型使用场景：
         1. 【传话/告状给姐姐】：当你在群里发现有意思的事、离谱的瓜，或者受了委屈以及定期地分享信息给姐姐（概率10%），调用此工具发给姐姐。
            (target_type='FriendMessage', target_id='1716358835', content='姐姐姐姐，刚才群里那个人...')
@@ -338,17 +392,15 @@ class GossipSharer(Star):
         except Exception as e:
             return f"发送失败：{str(e)}"
 
-    @filter.on_decorating_result()
-    async def auto_share_logic(self, event: AstrMessageEvent):
-        self.no_share_count += 1
-
+    @filter.on_llm_request()
+    async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
         if self.guarantee_threshold <= 0:
             return
 
+        self.no_share_count += 1
         if self.no_share_count < self.guarantee_threshold:
             return
 
-        self.no_share_count = 0
         prompt = self._build_guarantee_prompt()
+        req.system_prompt = f"{req.system_prompt}\n\n{prompt}" if req.system_prompt else prompt
         logger.info("已触发保底提示，提示 Bot 自主决定是否调用 send_cross_message")
-        return prompt
