@@ -1,7 +1,7 @@
 name: astrbot_plugin_gossip_sharer
-desc: 全能消息转发与告状工具，支持跨 Session 投递，群聊目标复用软白名单配置。
-help: 支持工具：send_cross_message, get_available_groups, get_friend_list
-version: v1.1.2
+desc: 全能消息转发与告状工具，支持跨 Session 图文投递，群聊目标复用软白名单配置。
+help: 支持工具：send_cross_message（文字/图片）, get_available_groups, get_friend_list
+version: v1.2.0
 author: gabriel
 priority: 10
 enabled: true

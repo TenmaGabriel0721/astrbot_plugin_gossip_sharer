@@ -1,24 +1,35 @@
 {
     "default_platform": {
         "type": "string",
-        "default": "1207797855",
-        "description": "默认平台 ID。不填写时使用内置默认值 1207797855"
+        "default": "",
+        "description": "默认平台 ID。留空时发送必须显式传入 target_platform，避免误发到固定平台。"
     },
     "sister_qq": {
         "type": "string",
-        "default": "1716358835",
-        "description": "姐姐的 QQ 号"
+        "default": "",
+        "description": "姐姐的 QQ 号。默认安全策略下，私聊转发只允许发送到该 QQ。"
     },
     "group_whitelist": {
         "type": "list",
-        "default": [
-            "984252223"
-        ],
-        "description": "额外允许转发消息的群号列表，会与 soft_whitelist 的 group_whitelist 合并"
+        "items": {
+            "type": "string"
+        },
+        "default": [],
+        "description": "额外允许转发消息的群号列表，会与 soft_whitelist 的 group_whitelist 合并。"
+    },
+    "enable_arbitrary_friend_targets": {
+        "type": "bool",
+        "default": false,
+        "description": "是否允许 FriendMessage 发送到任意私聊目标。关闭时只允许发送给 sister_qq。"
     },
     "guarantee_threshold": {
         "type": "int",
         "default": 5,
-        "description": "保底阈值（连续多少次没打报告后强制触发告状冲动）"
+        "description": "保底阈值。按来源会话独立计数，达到阈值时只注入一次提示；小于等于 0 表示关闭。"
+    },
+    "attempt_target_llm_trigger": {
+        "type": "bool",
+        "default": false,
+        "description": "实验选项：尝试触发目标会话 LLM。当前默认只发送消息并写入目标上下文，开启后也仅做 best-effort。"
     }
 }
