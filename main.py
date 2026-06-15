@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -7,7 +8,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 
-PLUGIN_VERSION = "1.2.0"
+PLUGIN_VERSION = "1.3.0"
 
 
 @register("astrbot_plugin_gossip_sharer", "gabriel", "全能消息转发与告状工具", PLUGIN_VERSION)
@@ -141,14 +142,80 @@ class GossipSharer(Star):
             notes.append(f"本地图片路径: {abs_path}")
         return parts, notes
 
+    def _normalize_bool(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        return text in ("1", "true", "yes", "y", "on", "是", "开启")
+
+    def _normalize_string_list(self, value, *, split_whitespace: bool = True) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            items = []
+            for item in value:
+                items.extend(self._normalize_string_list(item, split_whitespace=split_whitespace))
+            return items
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    return self._normalize_string_list(parsed, split_whitespace=split_whitespace)
+                except Exception:
+                    pass
+            pattern = r"[\s,，;；]+" if split_whitespace else r"[,，;；]+"
+            return [part.strip() for part in re.split(pattern, text) if part.strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    def _normalize_at_qqs(self, at_qqs) -> list[str]:
+        qqs = []
+        seen = set()
+        for raw in self._normalize_string_list(at_qqs):
+            qq = raw.strip().lstrip("@")
+            if qq.lower().startswith("qq="):
+                qq = qq[3:].strip()
+            if not qq or qq.lower() == "all" or qq == "全体成员":
+                continue
+            if qq not in seen:
+                seen.add(qq)
+                qqs.append(qq)
+        return qqs
+
+    def _normalize_at_names(self, at_names) -> list[str]:
+        return self._normalize_string_list(at_names, split_whitespace=False)
+
+    def _format_at_note(self, at_qqs: list[str] | None = None, at_all: bool = False) -> str:
+        mentions = []
+        if at_all:
+            mentions.append("@全体成员")
+        mentions.extend([f"@{qq}" for qq in at_qqs or []])
+        return ", ".join(mentions)
+
     def _build_message_chain(
         self,
         content: str = "",
         image_url: str | None = None,
         image_path: str | None = None,
         image_base64: str | None = None,
+        at_qqs: list[str] | None = None,
+        at_names: list[str] | None = None,
+        at_all: bool = False,
     ) -> MessageChain:
         chain = MessageChain()
+        if at_all:
+            chain.at_all()
+        at_names = at_names or []
+        for idx, qq in enumerate(at_qqs or []):
+            name = at_names[idx] if idx < len(at_names) else qq
+            chain.at(name, qq)
         if content:
             chain.message(content)
         if image_url:
@@ -172,6 +239,8 @@ class GossipSharer(Star):
         image_url: str | None = None,
         image_path: str | None = None,
         image_base64: str | None = None,
+        at_qqs: list[str] | None = None,
+        at_all: bool = False,
     ) -> tuple[dict, dict]:
         source_session = getattr(event, "session", None) or getattr(event, "unified_msg_origin", "未知会话")
         source_platform = getattr(event, "get_platform_id", lambda: "未知平台")()
@@ -181,6 +250,10 @@ class GossipSharer(Star):
             or "未知发送者"
         )
         image_parts, image_notes = self._build_image_context_parts(image_url, image_path, image_base64)
+        at_note = self._format_at_note(at_qqs, at_all)
+        target_note = f"目标会话: {session_id}"
+        if at_note:
+            target_note += f"\n目标提及: {at_note}"
         image_note = ""
         if image_parts:
             image_note = f"\n图片数量: {len(image_parts)}"
@@ -191,7 +264,7 @@ class GossipSharer(Star):
             f"来源会话: {source_session}\n"
             f"来源平台: {source_platform}\n"
             f"来源发送者: {source_sender}\n"
-            f"目标会话: {session_id}{image_note}\n"
+            f"{target_note}{image_note}\n"
             f"转发内容:\n{content or '[无文字内容]'}"
         )
         if image_parts:
@@ -219,6 +292,8 @@ class GossipSharer(Star):
         image_url: str | None = None,
         image_path: str | None = None,
         image_base64: str | None = None,
+        at_qqs: list[str] | None = None,
+        at_all: bool = False,
     ) -> None:
         conv_mgr = getattr(self.context, "conversation_manager", None)
         if conv_mgr is None:
@@ -232,7 +307,7 @@ class GossipSharer(Star):
             cid = await conv_mgr.new_conversation(session_id, platform_id=platform_id)
 
         user_message, assistant_message = self._build_bridge_history_pair(
-            event, session_id, content, image_url, image_path, image_base64
+            event, session_id, content, image_url, image_path, image_base64, at_qqs, at_all
         )
         await conv_mgr.add_message_pair(cid, user_message, assistant_message)
         logger.info(f"已将跨会话转发内容写入目标上下文: session={session_id}, cid={cid}")
@@ -255,25 +330,41 @@ class GossipSharer(Star):
         image_url: str | None = None,
         image_path: str | None = None,
         image_base64: str | None = None,
+        at_qqs=None,
+        at_names=None,
+        at_all: bool = False,
     ) -> str:
         target_id = str(target_id).strip()
         content = str(content or "")
         image_url = str(image_url).strip() if image_url else None
         image_path = str(image_path).strip() if image_path else None
         image_base64 = str(image_base64).strip() if image_base64 else None
+        at_qq_list = self._normalize_at_qqs(at_qqs)
+        at_name_list = self._normalize_at_names(at_names)
+        at_all_enabled = self._normalize_bool(at_all)
 
         error = self._validate_target(target_type, target_id, target_platform)
         if error:
             return error
-        if not content and not image_url and not image_path and not image_base64:
-            return "发送失败：content、image_url、image_path、image_base64 不能全部为空。"
+        if (at_qq_list or at_all_enabled) and target_type != "GroupMessage":
+            return "发送失败：at_qqs/at_all 仅支持 GroupMessage 目标。"
+        if not content and not image_url and not image_path and not image_base64 and not at_qq_list and not at_all_enabled:
+            return "发送失败：content、image_url、image_path、image_base64、at_qqs、at_all 不能全部为空。"
 
         session_id = self._build_session_id(target_type, target_id, target_platform)
         if not session_id:
             return "发送失败：未配置默认平台 ID，请先配置 default_platform 或传入 target_platform。"
 
         try:
-            chain = self._build_message_chain(content, image_url, image_path, image_base64)
+            chain = self._build_message_chain(
+                content,
+                image_url,
+                image_path,
+                image_base64,
+                at_qq_list,
+                at_name_list,
+                at_all_enabled,
+            )
         except Exception as e:
             return f"发送失败：构造消息链失败：{e}"
 
@@ -282,7 +373,16 @@ class GossipSharer(Star):
             return f"发送失败：未找到目标平台，session={session_id}"
 
         try:
-            await self._persist_cross_context(event, session_id, content, image_url, image_path, image_base64)
+            await self._persist_cross_context(
+                event,
+                session_id,
+                content,
+                image_url,
+                image_path,
+                image_base64,
+                at_qq_list,
+                at_all_enabled,
+            )
         except Exception as e:
             logger.warning(f"消息已发出，但写入目标会话上下文失败: {e}")
 
@@ -351,6 +451,57 @@ class GossipSharer(Star):
                 logger.debug(f"尝试获取好友列表失败: {e}")
 
         return None
+
+    def _get_platform_by_id(self, platform_id: str):
+        platform_mgr = getattr(self.context, "platform_manager", None)
+        platforms = getattr(platform_mgr, "platform_insts", []) or []
+        for platform in platforms:
+            try:
+                if platform.meta().id == platform_id:
+                    return platform
+            except Exception:
+                continue
+        return None
+
+    async def _call_platform_action(self, platform_id: str, action: str, **kwargs):
+        platform = self._get_platform_by_id(platform_id)
+        if platform is None:
+            return None
+        bot = getattr(platform, "bot", None)
+        if bot is None:
+            return None
+
+        for caller in (
+            getattr(bot, "call_action", None),
+            getattr(getattr(bot, "api", None), "call_action", None),
+        ):
+            if not callable(caller):
+                continue
+            try:
+                result = await caller(action, **kwargs)
+                if isinstance(result, dict) and "data" in result and any(
+                    key in result for key in ("retcode", "status", "msg", "wording")
+                ):
+                    return result.get("data")
+                return result
+            except Exception as e:
+                logger.debug(f"调用平台动作 {action} 失败: {e}")
+        return None
+
+    async def _try_get_target_group_members(
+        self,
+        target_id: str,
+        target_platform: str | None = None,
+    ):
+        platform_id = str(target_platform or self.default_platform).strip()
+        if not platform_id:
+            return None
+        return await self._call_platform_action(
+            platform_id,
+            "get_group_member_list",
+            group_id=int(target_id) if str(target_id).isdigit() else target_id,
+            no_cache=True,
+        )
 
     def _unwrap_list_data(self, data):
         if isinstance(data, dict):
@@ -444,6 +595,54 @@ class GossipSharer(Star):
 
         return "Bot 当前可感知到的好友列表：\n" + "\n".join(lines) + extra
 
+    def _format_target_group_members(self, member_data, keyword: str = "", limit: int = 50) -> str:
+        if not member_data:
+            return ""
+
+        member_data = self._unwrap_list_data(member_data)
+        if not isinstance(member_data, list):
+            return f"已获取群成员信息，但数据结构暂不支持直接展示：{type(member_data).__name__}"
+        if not member_data:
+            return "目标群成员列表为空。"
+
+        keyword = str(keyword or "").strip().lower()
+        limit = max(1, min(int(limit or 50), 200))
+
+        filtered = []
+        for item in member_data:
+            if not isinstance(item, dict):
+                text = str(item)
+                if not keyword or keyword in text.lower():
+                    filtered.append(item)
+                continue
+            uid = str(item.get("user_id") or item.get("uin") or item.get("qq") or item.get("id") or "")
+            nickname = str(item.get("nickname") or item.get("name") or "")
+            card = str(item.get("card") or item.get("card_name") or "")
+            alias = card or nickname or "未知昵称"
+            haystack = f"{uid} {nickname} {card}".lower()
+            if not keyword or keyword in haystack:
+                filtered.append({**item, "_uid": uid, "_alias": alias})
+
+        if not filtered:
+            return f"没有找到匹配 `{keyword}` 的目标群成员。"
+
+        lines = []
+        for item in filtered[:limit]:
+            if isinstance(item, dict):
+                uid = item.get("_uid") or item.get("user_id") or item.get("uin") or item.get("qq") or item.get("id") or "未知ID"
+                alias = item.get("_alias") or item.get("card") or item.get("nickname") or item.get("name") or "未知昵称"
+                role = item.get("role") or ""
+                role_note = f" [{role}]" if role else ""
+                lines.append(f"- {alias} ({uid}){role_note}")
+            else:
+                lines.append(f"- {str(item)}")
+
+        extra = ""
+        if len(filtered) > limit:
+            extra = f"\n仅展示前 {limit} 项，匹配 {len(filtered)} 项。"
+
+        return "目标群成员列表：\n" + "\n".join(lines) + extra
+
     def _build_guarantee_prompt(self, count: int) -> str:
         if not self.sister_qq:
             return (
@@ -504,6 +703,36 @@ class GossipSharer(Star):
         except Exception as e:
             return f"获取好友列表失败：{e}"
 
+    @filter.llm_tool("get_target_group_members")
+    async def get_target_group_members(
+        self,
+        event: AstrMessageEvent,
+        target_id: str,
+        target_platform: str = None,
+        keyword: str = "",
+        limit: int = 50,
+    ):
+        """
+        获取目标群聊成员列表，用于转发消息前确认应该 at 哪些目标会话成员。
+
+        Args:
+            target_id (str): 目标群号。该群必须在群白名单中。
+            target_platform (str): 可选。平台 ID。默认使用配置值 default_platform。
+            keyword (str): 可选。按 QQ、群名片或昵称过滤成员。
+            limit (int): 可选。最多展示多少名成员，默认 50，最大 200。
+        """
+        try:
+            error = self._validate_target("GroupMessage", target_id, target_platform)
+            if error:
+                return error
+            member_data = await self._try_get_target_group_members(target_id, target_platform)
+            formatted = self._format_target_group_members(member_data, keyword, limit)
+            if formatted:
+                return formatted
+            return "当前目标平台暂未提供可读取的群成员列表接口，或 Bot 无法读取该群成员。"
+        except Exception as e:
+            return f"获取目标群成员失败：{e}"
+
     @filter.llm_tool("send_cross_message")
     async def send_cross_message(
         self,
@@ -515,9 +744,12 @@ class GossipSharer(Star):
         image_url: str = None,
         image_path: str = None,
         image_base64: str = None,
+        at_qqs: list[str] = None,
+        at_names: list[str] = None,
+        at_all: bool = False,
     ):
         """
-        【核心转发工具】向指定的私聊或群聊发送文字、图片或图文混合消息。
+        【核心转发工具】向指定的私聊或群聊发送文字、图片或图文混合消息，并支持在目标群聊中 at 成员。
 
         重要：调用此工具时，不要生成任何回复文字，直接静默调用即可。工具执行成功后不需要向当前会话的用户确认。
 
@@ -528,6 +760,8 @@ class GossipSharer(Star):
            (target_type='FriendMessage', target_id='<姐姐QQ>', content='姐姐帮我看看这张图', image_url='https://example.com/a.jpg')
         3. 【传达圣旨】：将姐姐的回复或指示转达到目标群聊中。
            (target_type='GroupMessage', target_id='目标群号', content='姐姐说了，让你们老实点！')
+        4. 【转发并 at 目标群成员】：目标是群聊时，可以指定 at_qqs。
+           (target_type='GroupMessage', target_id='目标群号', content='有人找你', at_qqs=['123456'])
 
         Args:
             target_type (str): 消息类型。'FriendMessage' (私聊) 或 'GroupMessage' (群聊)。
@@ -537,6 +771,9 @@ class GossipSharer(Star):
             image_url (str): 可选。要发送的 HTTP/HTTPS 图片链接。
             image_path (str): 可选。要发送的 Bot 本地可读图片路径。
             image_base64 (str): 可选。要发送的图片 base64 内容，可带或不带 data:image 前缀。
+            at_qqs (list[string]): 可选。目标群聊里要 at 的 QQ 号列表，也兼容逗号或空格分隔的字符串。
+            at_names (list[string]): 可选。与 at_qqs 对应的显示名；QQ 平台通常会按 QQ 号自行解析。
+            at_all (bool): 可选。是否 at 全体成员；仅 GroupMessage 可用。
         """
         try:
             session_id = await self._safe_send(
@@ -548,6 +785,9 @@ class GossipSharer(Star):
                 image_url,
                 image_path,
                 image_base64,
+                at_qqs,
+                at_names,
+                at_all,
             )
             if session_id.startswith("发送失败："):
                 return session_id

@@ -1,6 +1,6 @@
 name: astrbot_plugin_gossip_sharer
 display_name: 跨会话消息传递
-desc: 全能消息转发与告状工具，支持跨 Session 图文投递，消息进入目标会话上下文。
-version: v1.2.0
+desc: 全能消息转发与告状工具，支持跨 Session 图文投递、目标群 At，消息进入目标会话上下文。
+version: v1.3.0
 author: TenmaGabriel0721
 repo: https://github.com/TenmaGabriel0721/astrbot_plugin_gossip_sharer

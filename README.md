@@ -6,12 +6,13 @@
 
 - **跨会话转发**：通过 `send_cross_message` 工具向私聊或群聊发送消息。
 - **图文转发**：支持纯文字、纯图片、图文混合消息；图片可来自 HTTP/HTTPS URL、本地文件路径或 base64。
+- **目标群 At**：转发到群聊时可指定目标群成员 QQ，发送消息时在目标会话内真正 @ 对方；也支持 @全体成员。
 - **私聊目标安全开关**：默认只允许向 `sister_qq` 私聊转发；如确需任意私聊目标，可开启 `enable_arbitrary_friend_targets`。
 - **群聊白名单**：`GroupMessage` 目标必须在群白名单内。
 - **软白名单联动**：自动读取 `astrbot_plugin_soft_whitelist_config.json` 的 `group_whitelist`，并与本插件配置的 `group_whitelist` 合并去重。
 - **保底提示**：按来源会话独立统计连续未转发次数，达到阈值时在 LLM 请求阶段注入一次提示，让模型自行判断是否调用 `send_cross_message`。
 - **目标上下文注入**：转发成功后，把图文桥接信息写入目标会话上下文，方便目标会话后续 LLM 理解来源与内容。
-- **列表查询**：支持尝试读取群列表和好友列表；平台不支持时返回降级说明。
+- **列表查询**：支持尝试读取群列表、好友列表和目标群成员列表；平台不支持时返回降级说明。
 
 ## 配置项
 
@@ -41,8 +42,11 @@
 - `image_url`: 可选，HTTP/HTTPS 图片链接
 - `image_path`: 可选，Bot 进程本地可读的图片路径
 - `image_base64`: 可选，图片 base64 内容，可带 `data:image/...;base64,` 或 `base64://` 前缀
+- `at_qqs`: 可选，目标群聊中要 @ 的 QQ 号列表；也兼容逗号或空格分隔字符串
+- `at_names`: 可选，与 `at_qqs` 对应的显示名；QQ 平台通常会按 QQ 号自行解析
+- `at_all`: 可选，是否 @全体成员，仅 `GroupMessage` 可用
 
-至少需要提供 `content`、`image_url`、`image_path`、`image_base64` 之一。
+至少需要提供 `content`、`image_url`、`image_path`、`image_base64`、`at_qqs`、`at_all` 之一。
 
 示例：
 
@@ -56,11 +60,19 @@ target_type='FriendMessage', target_id='<姐姐QQ>', content='给你看这张图
 # 转发本地图片到白名单群
 target_type='GroupMessage', target_id='<目标群号>', content='姐姐说看图', image_path='/path/to/image.jpg'
 
+# 转发到白名单群并 @ 目标群成员
+target_type='GroupMessage', target_id='<目标群号>', content='有人找你', at_qqs=['123456789']
+
+# 转发到白名单群并 @ 全体成员
+target_type='GroupMessage', target_id='<目标群号>', content='集合', at_all=true
+
 # 转发 base64 图片
 target_type='FriendMessage', target_id='<姐姐QQ>', image_base64='iVBORw0KGgoAAAANSUhEUg...'
 ```
 
 当 `target_type` 为 `GroupMessage` 时，目标群必须在合并后的群白名单中。
+
+`at_qqs` 和 `at_all` 仅支持 `GroupMessage`。如果不确定目标群成员 QQ，可先调用 `get_target_group_members` 查询目标群成员，再把成员 QQ 传给 `at_qqs`。
 
 当 `target_type` 为 `FriendMessage` 时：
 
@@ -74,6 +86,15 @@ target_type='FriendMessage', target_id='<姐姐QQ>', image_base64='iVBORw0KGgoAA
 ### `get_friend_list`
 
 尝试获取当前 Bot 所在平台支持的好友列表。若当前平台未实现好友列表接口，则返回降级提示；已配置的 `sister_qq` 仍可作为默认私聊目标参考。
+
+### `get_target_group_members`
+
+获取指定白名单群的成员列表，用于转发前确认目标会话里应该 @ 谁。
+
+- `target_id`: 目标群号，必须在群白名单中
+- `target_platform`: 可选，目标平台；不传时使用 `default_platform`
+- `keyword`: 可选，按 QQ、群名片或昵称过滤
+- `limit`: 可选，最多展示多少名成员，默认 50，最大 200
 
 ## 自动保底逻辑
 
