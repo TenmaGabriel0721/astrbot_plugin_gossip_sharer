@@ -1,14 +1,20 @@
 import json
 import os
 import re
+import time
+import uuid
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import At, Plain
+from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.6.0"
+SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
+DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 
 
 @register("astrbot_plugin_gossip_sharer", "gabriel", "全能消息转发与告状工具", PLUGIN_VERSION)
@@ -22,8 +28,8 @@ class GossipSharer(Star):
         self.enable_arbitrary_friend_targets = bool(
             self.config.get("enable_arbitrary_friend_targets", False)
         )
-        self.attempt_target_llm_trigger = bool(
-            self.config.get("attempt_target_llm_trigger", False)
+        self.enable_target_session_tasks = bool(
+            self.config.get("enable_target_session_tasks", True)
         )
         self.group_whitelist = []
         self._load_group_whitelist()
@@ -38,7 +44,8 @@ class GossipSharer(Star):
         logger.info(
             f"转发告状工具 v{PLUGIN_VERSION} 已加载。姐姐: {self.sister_qq or '未配置'}，"
             f"默认平台: {self.default_platform or '未配置'}，白名单群数量: {len(self.group_whitelist)}，"
-            f"保底阈值: {self.guarantee_threshold}，任意私聊目标: {self.enable_arbitrary_friend_targets}"
+            f"保底阈值: {self.guarantee_threshold}，任意私聊目标: {self.enable_arbitrary_friend_targets}，"
+            f"目标会话任务唤醒: {self.enable_target_session_tasks}"
         )
 
     def _soft_whitelist_config_path(self) -> str:
@@ -84,6 +91,67 @@ class GossipSharer(Star):
         if event is None:
             return "未知会话"
         return str(getattr(event, "unified_msg_origin", None) or getattr(event, "session", "未知会话"))
+
+    def _unwrap_message_event(self, event_or_context) -> AstrMessageEvent | None:
+        if event_or_context is None:
+            return None
+
+        candidates = [event_or_context]
+        seen = set()
+        while candidates:
+            candidate = candidates.pop(0)
+            if candidate is None:
+                continue
+            marker = id(candidate)
+            if marker in seen:
+                continue
+            seen.add(marker)
+
+            if callable(getattr(candidate, "get_platform_name", None)) and callable(
+                getattr(candidate, "get_sender_id", None)
+            ):
+                return candidate
+
+            inner_context = getattr(candidate, "context", None)
+            candidates.append(getattr(inner_context, "event", None))
+            candidates.append(getattr(candidate, "event", None))
+
+        return None
+
+    def _describe_event_like(self, event_or_context) -> str:
+        if event_or_context is None:
+            return "None"
+        inner_context = getattr(event_or_context, "context", None)
+        inner_event = getattr(inner_context, "event", None)
+        if inner_event is not None:
+            return (
+                f"{type(event_or_context).__name__}"
+                f"(context={type(inner_context).__name__}, event={type(inner_event).__name__})"
+            )
+        return type(event_or_context).__name__
+
+    def _get_delegated_task_payload(self, event: AstrMessageEvent | None) -> dict:
+        if event is None:
+            return {}
+        try:
+            payload = event.get_extra(DELEGATED_TASK_EXTRA, {})
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _get_effective_requester(
+        self, event: AstrMessageEvent | None
+    ) -> tuple[str, str]:
+        payload = self._get_delegated_task_payload(event)
+        requester_id = str(payload.get("requester_id") or "").strip()
+        requester_name = str(payload.get("requester_name") or "").strip()
+        if not requester_id and event is not None:
+            requester_id = str(getattr(event, "get_sender_id", lambda: "")() or "").strip()
+        if not requester_name and event is not None:
+            requester_name = str(getattr(event, "get_sender_name", lambda: "")() or "").strip()
+        if not requester_name:
+            requester_name = requester_id
+        return requester_id, requester_name
 
     def _reset_no_share_count(self, event: AstrMessageEvent | None) -> None:
         self.no_share_counts.pop(self._event_key(event), None)
@@ -192,6 +260,41 @@ class GossipSharer(Star):
     def _normalize_at_names(self, at_names) -> list[str]:
         return self._normalize_string_list(at_names, split_whitespace=False)
 
+    def _normalize_target_type_name(self, target_type: str | None, default: str = "GroupMessage") -> str:
+        text = str(target_type or default).strip()
+        mapping = {
+            "group": "GroupMessage",
+            "groupmessage": "GroupMessage",
+            "group_message": "GroupMessage",
+            "群": "GroupMessage",
+            "群聊": "GroupMessage",
+            "qq群": "GroupMessage",
+            "friend": "FriendMessage",
+            "private": "FriendMessage",
+            "friendmessage": "FriendMessage",
+            "friend_message": "FriendMessage",
+            "private_message": "FriendMessage",
+            "私聊": "FriendMessage",
+            "好友": "FriendMessage",
+        }
+        return mapping.get(text.lower(), text)
+
+    def _effective_target_platform_id(
+        self,
+        event: AstrMessageEvent | None = None,
+        target_platform: str | None = None,
+    ) -> str:
+        platform_id = str(target_platform or self.default_platform or "").strip()
+        if platform_id or event is None:
+            return platform_id
+
+        try:
+            if event.get_platform_name() == "aiocqhttp":
+                return str(event.get_platform_id() or "").strip()
+        except Exception:
+            pass
+        return ""
+
     def _format_at_note(self, at_qqs: list[str] | None = None, at_all: bool = False) -> str:
         mentions = []
         if at_all:
@@ -284,6 +387,36 @@ class GossipSharer(Star):
         }
         return user_message, assistant_message
 
+    def _is_synthetic_event(self, event: AstrMessageEvent | None) -> bool:
+        if event is None:
+            return False
+        try:
+            return bool(event.get_extra(SYNTHETIC_EVENT_EXTRA, False))
+        except Exception:
+            return False
+
+    async def _resolve_qq_self_id(self, platform) -> str:
+        bot = getattr(platform, "bot", None)
+        caller = getattr(bot, "call_action", None)
+        if callable(caller):
+            try:
+                info = await caller("get_login_info")
+                if isinstance(info, dict):
+                    data = info.get("data") if isinstance(info.get("data"), dict) else info
+                    self_id = data.get("user_id") or data.get("self_id")
+                    if self_id:
+                        return str(self_id)
+            except Exception as e:
+                logger.debug(f"获取 QQ self_id 失败，使用平台 ID 兜底: {e}")
+
+        try:
+            platform_id = platform.meta().id
+            if platform_id:
+                return str(platform_id)
+        except Exception:
+            pass
+        return str(self.default_platform or "")
+
     async def _persist_cross_context(
         self,
         event: AstrMessageEvent,
@@ -312,14 +445,6 @@ class GossipSharer(Star):
         await conv_mgr.add_message_pair(cid, user_message, assistant_message)
         logger.info(f"已将跨会话转发内容写入目标上下文: session={session_id}, cid={cid}")
 
-    async def _try_trigger_target_llm(self, session_id: str) -> None:
-        if not self.attempt_target_llm_trigger:
-            return
-        logger.warning(
-            "已开启 attempt_target_llm_trigger，但当前版本未默认注入跨平台模拟事件；"
-            f"已完成消息发送与上下文持久化，目标会话: {session_id}"
-        )
-
     async def _safe_send(
         self,
         event: AstrMessageEvent,
@@ -334,6 +459,14 @@ class GossipSharer(Star):
         at_names=None,
         at_all: bool = False,
     ) -> str:
+        original_event = event
+        event = self._unwrap_message_event(event)
+        if event is None:
+            return (
+                "发送失败：无法从工具上下文识别当前来源事件。"
+                f"收到的对象类型：{self._describe_event_like(original_event)}。"
+            )
+
         target_id = str(target_id).strip()
         content = str(content or "")
         image_url = str(image_url).strip() if image_url else None
@@ -386,7 +519,6 @@ class GossipSharer(Star):
         except Exception as e:
             logger.warning(f"消息已发出，但写入目标会话上下文失败: {e}")
 
-        await self._try_trigger_target_llm(session_id)
         self._reset_no_share_count(event)
         return session_id
 
@@ -657,12 +789,155 @@ class GossipSharer(Star):
             "并把你认为值得分享的最近内容整理后发过去。"
         )
 
+    def _build_target_task_text(self, task_payload: dict) -> str:
+        requester_id = str(task_payload.get("requester_id") or "").strip()
+        requester_name = str(task_payload.get("requester_name") or requester_id).strip()
+        source_session = str(task_payload.get("source_session") or "").strip()
+        task = str(task_payload.get("task") or "").strip()
+
+        lines = [
+            "[跨会话任务]",
+            f"来源会话: {source_session}",
+            f"请求者: {requester_name}({requester_id})" if requester_id else f"请求者: {requester_name}",
+            "请在当前目标 QQ 会话中直接完成下面的任务；不要只转述任务。",
+            f"任务: {task}",
+        ]
+        return "\n".join(lines)
+
+    async def _build_qq_task_wake_event(
+        self,
+        platform,
+        task_payload: dict,
+    ) -> AstrMessageEvent:
+        target_id = str(task_payload.get("target_id") or "").strip()
+        requester_id = str(task_payload.get("requester_id") or "").strip()
+        requester_name = str(task_payload.get("requester_name") or requester_id or "跨会话任务").strip()
+        self_id = await self._resolve_qq_self_id(platform)
+        task_text = self._build_target_task_text(task_payload)
+
+        message = AstrBotMessage()
+        message.self_id = self_id
+        message.message_id = f"gossip-task-{uuid.uuid4().hex}"
+        message.timestamp = int(time.time())
+        message.raw_message = None
+        message.message_str = task_text
+        message.message = []
+        if self_id:
+            message.message.append(At(qq=self_id, name=""))
+        message.message.append(Plain(task_text))
+        message.type = MessageType.GROUP_MESSAGE
+        message.group_id = target_id
+        message.group = Group(group_id=target_id)
+        message.sender = MessageMember(user_id=requester_id, nickname=requester_name)
+        message.session_id = target_id
+
+        target_event = platform.create_event(message)
+        target_event.set_extra(SYNTHETIC_EVENT_EXTRA, True)
+        target_event.set_extra(DELEGATED_TASK_EXTRA, task_payload)
+        target_event.set_extra("gossip_sharer_source_session", task_payload.get("source_session"))
+        target_event.set_extra("gossip_sharer_target_session", task_payload.get("target_session"))
+        target_event.is_wake = True
+        target_event.is_at_or_wake_command = True
+        return target_event
+
+    async def _safe_wake_qq_session_task(
+        self,
+        event: AstrMessageEvent,
+        target_id: str,
+        task: str,
+        target_type: str = "GroupMessage",
+        target_platform: str | None = None,
+    ) -> str:
+        if not self.enable_target_session_tasks:
+            return "唤醒失败：目标会话任务唤醒工具未启用。"
+
+        original_event = event
+        event = self._unwrap_message_event(event)
+        if event is None:
+            return (
+                "唤醒失败：无法从工具上下文识别当前来源事件。"
+                f"收到的对象类型：{self._describe_event_like(original_event)}。"
+            )
+
+        try:
+            if event.get_platform_name() != "aiocqhttp":
+                return (
+                    "唤醒失败：目标会话任务当前只支持 QQ OneBot(aiocqhttp) 来源事件，"
+                    f"实际来源平台为 {event.get_platform_name()}。"
+                )
+        except Exception:
+            return "唤醒失败：无法识别当前来源平台。"
+
+        requester_id, requester_name = self._get_effective_requester(event)
+        if not requester_id:
+            return "唤醒失败：无法识别请求者 QQ。"
+
+        target_type = self._normalize_target_type_name(target_type, "GroupMessage")
+        target_id = str(target_id or "").strip()
+        task = str(task or "").strip()
+        platform_id = self._effective_target_platform_id(event, target_platform)
+        if not task:
+            return "唤醒失败：task 不能为空。"
+        if not platform_id:
+            return "唤醒失败：未配置默认平台 ID，也无法从当前 QQ 事件推断目标平台。"
+        if target_type != "GroupMessage":
+            return "唤醒失败：当前目标会话任务只开放 QQ 群目标。"
+
+        error = self._validate_target("GroupMessage", target_id, platform_id)
+        if error:
+            return error.replace("发送失败：", "唤醒失败：", 1)
+
+        session_id = self._build_session_id(target_type, target_id, platform_id)
+        if not session_id:
+            return "唤醒失败：无法构造目标会话。"
+
+        task_payload = {
+            "target_session": session_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "target_platform": platform_id,
+            "task": task,
+            "requester_id": requester_id,
+            "requester_name": requester_name,
+            "source_session": self._event_key(event),
+            "source_platform": getattr(event, "get_platform_id", lambda: "")(),
+            "source_message": getattr(event, "get_message_str", lambda: "")(),
+            "origin": "gossip_sharer",
+        }
+
+        platform = self._get_platform_by_id(platform_id)
+        if platform is None:
+            return f"唤醒失败：未找到目标平台 {platform_id}。"
+        try:
+            platform_meta = platform.meta()
+        except Exception:
+            return "唤醒失败：无法读取目标平台信息。"
+        if platform_meta.name != "aiocqhttp":
+            return (
+                "唤醒失败：目标会话 LLM 唤醒只支持 QQ OneBot(aiocqhttp)，"
+                f"实际平台为 {platform_meta.name}。"
+            )
+
+        try:
+            target_event = await self._build_qq_task_wake_event(platform, task_payload)
+            platform.commit_event(target_event)
+        except Exception as e:
+            logger.warning(f"投递目标 QQ 会话 LLM 唤醒事件失败: {e}", exc_info=True)
+            return f"唤醒失败：投递目标 QQ 会话 LLM 唤醒事件失败：{e}"
+
+        logger.info(
+            f"已投递目标 QQ 会话 LLM 唤醒事件: target={session_id}, "
+            f"requester={requester_id}, task={task}"
+        )
+        return f"{session_id} <- {task}"
+
     @filter.llm_tool("get_available_groups")
     async def get_groups(self, event: AstrMessageEvent):
         """
         获取 Bot 当前可感知到的群聊列表，并标注哪些群在白名单中可用于转发。
         """
         try:
+            event = self._unwrap_message_event(event)
             group_data = await self._try_get_group_list(event)
             formatted = self._format_group_list(group_data)
 
@@ -690,6 +965,7 @@ class GossipSharer(Star):
         获取 Bot 当前可感知到的好友列表；若当前平台不支持，则返回降级说明。
         """
         try:
+            event = self._unwrap_message_event(event)
             friend_data = await self._try_get_friend_list(event)
             formatted = self._format_friend_list(friend_data)
             if formatted:
@@ -722,6 +998,7 @@ class GossipSharer(Star):
             limit (int): 可选。最多展示多少名成员，默认 50，最大 200。
         """
         try:
+            event = self._unwrap_message_event(event)
             error = self._validate_target("GroupMessage", target_id, target_platform)
             if error:
                 return error
@@ -795,8 +1072,60 @@ class GossipSharer(Star):
         except Exception as e:
             return f"发送失败：{str(e)}"
 
+    @filter.llm_tool("wake_qq_session_task")
+    async def wake_qq_session_task(
+        self,
+        event: AstrMessageEvent,
+        target_id: str,
+        task: str,
+        target_type: str = "GroupMessage",
+        target_platform: str = None,
+    ):
+        """
+        【目标 QQ 会话 LLM 唤醒/委派工具】把一项自然语言任务投递到指定 QQ 群，
+        让目标群自己的 LLM 在目标群上下文里醒来并处理。
+
+        重要：这是通用的跨群委派入口。用户想让你“去另一个群里做点什么”时优先考虑本工具，
+        包括传话、打小报告、转述当前会话发生的事、请目标群回应、让目标群 Bot 处理群内事务、
+        解禁/禁言/查询/提醒/协调等需要目标会话自己判断和执行的任务。
+
+        选择边界：
+        - 只是单向发送一段确定内容，不需要目标群 LLM 判断或回应时，用 send_cross_message。
+        - 需要目标群 LLM 结合目标群上下文、目标群工具和目标群权限来处理时，用本工具。
+        - task 必须写清楚要交给目标群 LLM 的完整任务；跨会话信息、要转述的话、打小报告的内容、
+          请求者希望目标群怎么处理，都应直接写进 task，不能假设目标群 LLM 能看到当前会话全文。
+
+        典型使用场景：
+        1. 用户说“去群 984252223 解禁我”：target_id='984252223', task='帮请求者解除禁言'。
+        2. 用户说“去群 984252223 禁言我 60 秒”：target_id='984252223', task='禁言请求者 60 秒'。
+        3. 用户说“去那个群打个小报告，说刚才 A 又在阴阳怪气”：target_id='目标群号', task='向当前目标群打小报告：刚才 A 又在阴阳怪气，请你根据目标群语境自然回应。'。
+        4. 用户说“去群里问问他们明天几点集合”：target_id='目标群号', task='询问当前目标群成员明天几点集合，并等待他们回应。'。
+        5. 用户说“把姐姐刚才的话转给群里，让他们自己看着办”：target_id='目标群号', task='向当前目标群转述：<姐姐刚才的话>。请根据当前目标群语境自然处理。'。
+
+        Args:
+            target_id (str): 目标 QQ 群号。必须在群白名单中。
+            task (str): 要交给目标会话 LLM 执行的自然语言任务，需保留用户原意和必要上下文。
+            target_type (str): 目标会话类型。当前只开放 GroupMessage，默认 GroupMessage。
+            target_platform (str): 可选。QQ 平台 ID。默认使用 default_platform；未配置时尝试使用当前 QQ 平台。
+        """
+        try:
+            result = await self._safe_wake_qq_session_task(
+                event,
+                target_id=target_id,
+                task=task,
+                target_type=target_type,
+                target_platform=target_platform,
+            )
+            if result.startswith("唤醒失败："):
+                return result
+            return f"目标会话 LLM 已唤醒：{result}"
+        except Exception as e:
+            return f"唤醒失败：{str(e)}"
+
     @filter.on_llm_request()
     async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
+        if self._is_synthetic_event(event):
+            return
         if self.guarantee_threshold <= 0:
             return
 

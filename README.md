@@ -7,6 +7,7 @@
 - **跨会话转发**：通过 `send_cross_message` 工具向私聊或群聊发送消息。
 - **图文转发**：支持纯文字、纯图片、图文混合消息；图片可来自 HTTP/HTTPS URL、本地文件路径或 base64。
 - **目标群 At**：转发到群聊时可指定目标群成员 QQ，发送消息时在目标会话内真正 @ 对方；也支持 @全体成员。
+- **目标会话 LLM 唤醒**：通过 `wake_qq_session_task` 把任务作为目标 QQ 群事件投递给目标会话 LLM，走正常 AstrBot pipeline。
 - **私聊目标安全开关**：默认只允许向 `sister_qq` 私聊转发；如确需任意私聊目标，可开启 `enable_arbitrary_friend_targets`。
 - **群聊白名单**：`GroupMessage` 目标必须在群白名单内。
 - **软白名单联动**：自动读取 `astrbot_plugin_soft_whitelist_config.json` 的 `group_whitelist`，并与本插件配置的 `group_whitelist` 合并去重。
@@ -24,8 +25,8 @@
 | `sister_qq` | string | 姐姐的 QQ 号，作为告状和保底提示的首选私聊目标。默认安全策略下，私聊只允许发给该 QQ。 |
 | `group_whitelist` | list | 额外允许转发消息的群号列表，会与软白名单插件的群白名单合并。 |
 | `enable_arbitrary_friend_targets` | bool | 是否允许 `FriendMessage` 发送到任意私聊目标。默认 `false`，即只允许发送给 `sister_qq`。 |
+| `enable_target_session_tasks` | bool | 是否启用目标 QQ 会话 LLM 任务唤醒工具。默认 `true`；群目标仍必须在白名单中。开启后任务会作为目标群事件进入正常 pipeline。 |
 | `guarantee_threshold` | int | 连续多少次 LLM 请求未成功转发后，注入一次保底提示；按来源会话独立计数，小于等于 0 表示关闭。 |
-| `attempt_target_llm_trigger` | bool | 实验选项。默认 `false`，当前版本主要保证发送与上下文持久化；开启后也仅做 best-effort，不保证跨平台触发目标会话 LLM。 |
 
 > 建议首次安装后手动配置 `default_platform` 与 `sister_qq`。插件不再内置固定平台 ID 或固定 QQ 号，避免复制部署时误发。
 
@@ -79,6 +80,47 @@ target_type='FriendMessage', target_id='<姐姐QQ>', image_base64='iVBORw0KGgoAA
 - 默认只允许发送给 `sister_qq`。
 - 如需发送到任意私聊目标，需显式开启 `enable_arbitrary_friend_targets`。
 
+### `wake_qq_session_task`
+
+把一条跨会话任务作为目标 QQ 群里的合成唤醒事件投递给目标会话 LLM。推荐用于“去某个群里做某事”这类请求，也适合传话、打小报告、转述当前会话发生的事、请目标群回应、让目标群 Bot 处理群内事务等需要目标会话自己判断和执行的场景。
+
+- `target_id`: 目标 QQ 群号，必须在群白名单中
+- `task`: 交给目标会话 LLM 执行的自然语言任务，需要包含用户原意和必要上下文
+- `target_type`: 当前只开放 `GroupMessage`
+- `target_platform`: 可选，目标平台；不传时使用 `default_platform`
+
+选择边界：
+
+- 只是单向发送一段确定内容，不需要目标群 LLM 判断或回应时，用 `send_cross_message`。
+- 需要目标群 LLM 结合目标群上下文、目标群工具和目标群权限来处理时，用 `wake_qq_session_task`。
+- `task` 要写清楚完整任务；跨会话信息、要转述的话、打小报告的内容、请求者希望目标群怎么处理，都应直接写进 `task`。
+
+示例：
+
+```text
+# 用户说“去群 984252223 解禁我”
+target_id='984252223',
+task='帮请求者解除禁言'
+
+# 用户说“去群 984252223 禁言我 60 秒”
+target_id='984252223',
+task='禁言请求者 60 秒'
+
+# 用户说“去群里说一句 xxx”
+target_id='984252223',
+task='向当前目标群发送：xxx'
+
+# 用户说“去那个群打个小报告，说刚才 A 又在阴阳怪气”
+target_id='984252223',
+task='向当前目标群打小报告：刚才 A 又在阴阳怪气，请你根据目标群语境自然回应。'
+
+# 用户说“去群里问问他们明天几点集合”
+target_id='984252223',
+task='询问当前目标群成员明天几点集合，并等待他们回应。'
+```
+
+该工具会构造一条目标 QQ 群里的合成消息事件，消息发送者为原请求者 QQ，并 @ Bot 唤醒目标会话 LLM。后续由 AstrBot 正常 waking/process/respond 流程处理：目标 LLM 的最终回复会自然发到目标群，目标会话配置的工具也按原规则可用。
+
 ### `get_available_groups`
 
 获取 Bot 当前可感知到的群聊列表，并标注哪些群在白名单中可用于转发。若平台无法读取群列表，则返回已配置的群白名单。
@@ -109,14 +151,14 @@ target_type='FriendMessage', target_id='<姐姐QQ>', image_base64='iVBORw0KGgoAA
 
 ## 图片上下文与目标会话 LLM
 
-`context.send_message` 只负责主动发送消息，不会天然触发目标会话的 LLM pipeline。当前插件采用更可靠的默认策略：
+`context.send_message` 只负责主动发送消息，不会天然触发目标会话的 LLM pipeline。当前插件默认策略：
 
 1. 先把文字/图片消息发送到目标会话。
 2. 再把桥接说明写入目标会话上下文。
 3. 图片 URL 与 base64 会尽量以 OpenAI 兼容的 `image_url` content part 写入上下文；本地图片会记录本地路径并尝试写入 `file://` 引用。
 4. 目标会话后续自然触发 LLM 时，可读取这段桥接上下文。是否能真正理解图片，取决于当前 provider 是否支持多模态历史。
 
-`attempt_target_llm_trigger` 是实验配置，默认关闭。由于模拟目标会话事件涉及平台适配器差异，当前版本不把它作为可靠默认行为；即使开启，也不会影响消息发送与上下文持久化结果。
+如果需要立即让目标群 LLM 处理一项任务，使用 `wake_qq_session_task`；`send_cross_message` 只负责发送与上下文注入。
 
 ## 安装
 

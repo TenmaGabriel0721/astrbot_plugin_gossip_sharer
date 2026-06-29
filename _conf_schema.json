@@ -22,14 +22,14 @@
         "default": false,
         "description": "是否允许 FriendMessage 发送到任意私聊目标。关闭时只允许发送给 sister_qq。"
     },
+    "enable_target_session_tasks": {
+        "type": "bool",
+        "default": true,
+        "description": "是否启用目标 QQ 会话 LLM 任务唤醒工具。开启后可把跨会话任务作为目标群事件投递给目标会话 LLM。"
+    },
     "guarantee_threshold": {
         "type": "int",
         "default": 5,
         "description": "保底阈值。按来源会话独立计数，达到阈值时只注入一次提示；小于等于 0 表示关闭。"
-    },
-    "attempt_target_llm_trigger": {
-        "type": "bool",
-        "default": false,
-        "description": "实验选项：尝试触发目标会话 LLM。当前默认只发送消息并写入目标上下文，开启后也仅做 best-effort。"
     }
 }

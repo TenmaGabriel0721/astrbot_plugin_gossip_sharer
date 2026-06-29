@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.6.0
+
+- 精简 LLM 工具列表，移除旧的 `execute_qq_command` 直投指令工具和重复的 `request_group_unmute` 快捷工具。
+- 移除 `enable_qq_command_execution` 与 `attempt_target_llm_trigger` 配置项；跨会话任务统一通过 `wake_qq_session_task` 唤醒目标群 LLM。
+- `send_cross_message` 回归纯发送与上下文注入，不再支持发送后实验性触发目标会话 LLM。
+- 扩展 `wake_qq_session_task` 工具说明，覆盖传话、打小报告、目标群回应和目标群事务处理等通用委派场景。
+
+## v1.5.1
+
+- `wake_qq_session_task` 改为投递目标 QQ 群合成唤醒事件，进入 AstrBot 正常 waking/process/respond pipeline。
+- 目标 LLM 的最终回复会自然发送到目标群，不再要求使用 `send_message_to_user`。
+- 移除目标任务提示里对 `execute_qq_command` 的强制引导；目标会话按自己的 LLM 流程和工具配置直接处理任务。
+
+## v1.5.0
+
+- 新增 `wake_qq_session_task` 工具，参考 AstrBot 未来任务的主动唤醒模式，把任务委派给目标 QQ 群会话 LLM 异步执行。
+- 目标会话 agent 会读取目标会话上下文与工具配置；需要发送可见消息时使用 `send_message_to_user`，需要执行 QQAdmin/AstrBot 指令时使用 `execute_qq_command`。
+- `execute_qq_command` 支持在被委派唤醒的目标会话内省略 `target_id`，并把 `at_self=true` 解析为原请求者 QQ。
+- `request_group_unmute` 改为唤醒目标群 LLM 执行解禁任务，不再直接投递群指令。
+- 新增 `enable_target_session_tasks` 配置开关，默认启用。
+
+## v1.4.1
+
+- 兼容新版 AstrBot tool loop 的 `ContextWrapper[AstrAgentContext]` 工具上下文，修复 `execute_qq_command` 报“无法识别当前来源平台”的问题。
+- `send_cross_message`、列表查询工具也统一从工具上下文中解包真实消息事件。
+
+## v1.4.0
+
+- 新增 `execute_qq_command` 工具，可将 AstrBot 指令投递到指定 QQ 会话上下文执行。
+- 新增 `request_group_unmute` 快捷工具，用于“去某群解禁我”，会在目标群中执行 `解禁 @请求者`。
+- QQ 指令执行仅支持 OneBot/aiocqhttp；发起请求可来自 QQ 群聊或私聊。
+- 群指令目标继续复用群白名单；私聊指令目标只能是请求者自己，避免伪造其他私聊身份。
+- 新增 `enable_qq_command_execution` 配置开关，默认启用。
+- 文档中明确 `attempt_target_llm_trigger` 只用于尝试触发目标会话 LLM，不是指令执行功能。
+
+## v1.3.1
+
+- `attempt_target_llm_trigger` 在 QQ OneBot/aiocqhttp 下开始实际生效：发送成功并写入目标上下文后，会投递目标会话虚拟事件，尝试立即触发目标会话 LLM。
+- 虚拟事件会携带跨会话来源、目标会话、转发内容和图片附件，并跳过本插件的保底计数，避免二次触发循环。
+
 ## v1.3.0
 
 - `send_cross_message` 支持转发到目标群聊时 @ 指定成员。
