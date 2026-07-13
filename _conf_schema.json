@@ -24,7 +24,7 @@
         "type": "bool",
         "default": false,
         "description": "允许任意好友私聊",
-        "hint": "开启后，send_cross_message 和 wake_qq_session_task 可将 FriendMessage 发送到任意好友 QQ；关闭时仅允许“默认私聊对象 QQ”。",
+        "hint": "开启后，wake_qq_session_task 可进入任意好友的 FriendMessage 会话；关闭时仅允许“默认私聊对象 QQ”。插件内部附件投递同样遵循此限制。",
         "obvious_hint": true
     },
     "enable_target_session_tasks": {
@@ -34,10 +34,75 @@
         "hint": "控制 wake_qq_session_task。开启后，可把任务投递到目标 QQ 群聊或私聊的 LLM 会话；关闭后该工具会拒绝所有唤醒请求。",
         "obvious_hint": true
     },
+    "enable_wake_images": {
+        "type": "bool",
+        "default": true,
+        "description": "允许 wake 携带图片",
+        "hint": "开启后，Bot 可在 wake_qq_session_task 的 image_refs 中主动选择图片。图片会先提供给目标 LLM 识别，并在目标回复发送完成后投递到 QQ；未选择的图片不会自动发送。"
+    },
+    "enable_wake_files": {
+        "type": "bool",
+        "default": true,
+        "description": "允许 wake 携带文件",
+        "hint": "开启后，Bot 可在 wake_qq_session_task 的 file_refs 中主动选择文件。文件会生成一次性临时快照，在目标回复发送完成后投递；目标 LLM 会提前获得文件名、类型、大小和待投递状态。"
+    },
+    "allow_remote_attachment_urls": {
+        "type": "bool",
+        "default": true,
+        "description": "允许远程附件 URL",
+        "hint": "允许 image_refs 和 file_refs 直接使用 HTTP/HTTPS URL。当前消息及引用消息中由平台提供的远程附件不受此开关影响。若不需要 Bot 主动下载外部地址，可关闭以降低风险。",
+        "obvious_hint": true
+    },
+    "max_wake_images": {
+        "type": "int",
+        "default": 4,
+        "description": "单次图片数量上限",
+        "hint": "一次 wake 最多处理多少张主动选择的图片。设为 0 时禁止携带图片。"
+    },
+    "max_wake_files": {
+        "type": "int",
+        "default": 3,
+        "description": "单次文件数量上限",
+        "hint": "一次 wake 最多处理多少个主动选择的文件。设为 0 时禁止携带文件。"
+    },
+    "max_wake_image_mb": {
+        "type": "int",
+        "default": 15,
+        "description": "单张图片上限（MB）",
+        "hint": "超过此大小的图片不会发送，但文字任务仍会继续唤醒目标 LLM。"
+    },
+    "max_wake_file_mb": {
+        "type": "int",
+        "default": 50,
+        "description": "单个文件上限（MB）",
+        "hint": "超过此大小的文件不会发送，但文字任务仍会继续唤醒目标 LLM。"
+    },
+    "max_wake_total_mb": {
+        "type": "int",
+        "default": 100,
+        "description": "单次附件总上限（MB）",
+        "hint": "一次 wake 中所有成功准备的图片和文件合计不能超过此大小。附件按 image_refs、file_refs 的顺序处理。"
+    },
+    "max_source_message_chars": {
+        "type": "int",
+        "default": 4000,
+        "description": "来源消息最大长度",
+        "hint": "自动提供给目标 LLM 的原始来源消息最多保留多少字符。设为 0 时不附带原始消息，只保留 task。"
+    },
+    "attachment_allowed_roots": {
+        "type": "list",
+        "items": {
+            "type": "string"
+        },
+        "default": [],
+        "description": "额外附件安全目录",
+        "hint": "允许 Bot 主动发送其中本地文件的额外目录。默认已允许 AstrBot temp 和 workspaces；当前消息及引用消息中的附件不受目录限制。不要添加包含密钥、数据库或私人配置的目录。",
+        "obvious_hint": true
+    },
     "guarantee_threshold": {
         "type": "int",
         "default": 5,
-        "description": "未转发提醒阈值",
-        "hint": "每个来源会话连续多少次未成功转发后，向 LLM 注入一次是否需要分享的提醒。小于或等于 0 时关闭；达到阈值后不会持续重复提醒。"
+        "description": "未分享提醒阈值",
+        "hint": "每个来源会话连续多少次未成功执行跨会话行动后，向 LLM 注入一次是否需要分享的提醒。小于或等于 0 时关闭；达到阈值后不会持续重复提醒。"
     }
 }
