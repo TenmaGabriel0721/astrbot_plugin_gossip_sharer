@@ -2,12 +2,14 @@
     "default_platform": {
         "type": "string",
         "default": "",
-        "description": "默认平台 ID。留空时发送必须显式传入 target_platform，避免误发到固定平台。"
+        "description": "默认 QQ 平台 ID",
+        "hint": "跨会话发送和唤醒默认使用的平台实例 ID。留空时，工具会尝试从当前 QQ 事件推断；无法推断时必须显式传入 target_platform。"
     },
     "sister_qq": {
         "type": "string",
         "default": "",
-        "description": "姐姐的 QQ 号。默认安全策略下，私聊转发只允许发送到该 QQ。"
+        "description": "默认私聊对象 QQ",
+        "hint": "默认的私聊转发和私聊唤醒目标。关闭“允许任意好友私聊”时，FriendMessage 只能发送或唤醒此 QQ。"
     },
     "group_whitelist": {
         "type": "list",
@@ -15,21 +17,27 @@
             "type": "string"
         },
         "default": [],
-        "description": "额外允许转发消息的群号列表，会与 soft_whitelist 的 group_whitelist 合并。"
+        "description": "额外群白名单",
+        "hint": "允许跨会话发送和唤醒的 QQ 群号。这里的群号会与 soft_whitelist 插件的 group_whitelist 自动合并并去重。"
     },
     "enable_arbitrary_friend_targets": {
         "type": "bool",
         "default": false,
-        "description": "是否允许 FriendMessage 发送到任意私聊目标。关闭时只允许发送给 sister_qq。"
+        "description": "允许任意好友私聊",
+        "hint": "开启后，send_cross_message 和 wake_qq_session_task 可将 FriendMessage 发送到任意好友 QQ；关闭时仅允许“默认私聊对象 QQ”。",
+        "obvious_hint": true
     },
     "enable_target_session_tasks": {
         "type": "bool",
         "default": true,
-        "description": "是否启用目标 QQ 会话 LLM 任务唤醒工具。开启后可把跨会话任务作为目标群事件投递给目标会话 LLM。"
+        "description": "启用跨会话 LLM 唤醒",
+        "hint": "控制 wake_qq_session_task。开启后，可把任务投递到目标 QQ 群聊或私聊的 LLM 会话；关闭后该工具会拒绝所有唤醒请求。",
+        "obvious_hint": true
     },
     "guarantee_threshold": {
         "type": "int",
         "default": 5,
-        "description": "保底阈值。按来源会话独立计数，达到阈值时只注入一次提示；小于等于 0 表示关闭。"
+        "description": "未转发提醒阈值",
+        "hint": "每个来源会话连续多少次未成功转发后，向 LLM 注入一次是否需要分享的提醒。小于或等于 0 时关闭；达到阈值后不会持续重复提醒。"
     }
 }

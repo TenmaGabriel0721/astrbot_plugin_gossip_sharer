@@ -12,7 +12,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 
 
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.7.1"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 
@@ -179,36 +179,17 @@ class GossipSharer(Star):
                 return "发送失败：当前未开启任意私聊目标，仅允许发送给配置的 sister_qq。"
         return None
 
-    def _normalize_base64_data_uri(self, image_base64: str) -> str:
-        data = image_base64.strip()
-        if data.startswith("data:image/"):
-            return data
-        if data.startswith("base64://"):
-            data = data.removeprefix("base64://")
-        return f"data:image/jpeg;base64,{data}"
-
-    def _build_image_context_parts(
+    def _build_image_context_notes(
         self,
         image_url: str | None = None,
         image_path: str | None = None,
         image_base64: str | None = None,
-    ) -> tuple[list[dict], list[str]]:
-        parts = []
-        notes = []
-        if image_url:
-            parts.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
-        if image_base64:
-            parts.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._normalize_base64_data_uri(image_base64)},
-                }
-            )
-        if image_path:
-            abs_path = os.path.abspath(image_path.strip())
-            parts.append({"type": "image_url", "image_url": {"url": f"file:///{abs_path}"}})
-            notes.append(f"本地图片路径: {abs_path}")
-        return parts, notes
+    ) -> list[str]:
+        if not image_url and not image_path and not image_base64:
+            return []
+        return [
+            "图片已随跨会话消息发送；如需让 Bot 再次识别，请引用目标会话中的图片消息。"
+        ]
 
     def _normalize_bool(self, value) -> bool:
         if isinstance(value, bool):
@@ -352,14 +333,12 @@ class GossipSharer(Star):
             or getattr(event, "get_sender_id", lambda: None)()
             or "未知发送者"
         )
-        image_parts, image_notes = self._build_image_context_parts(image_url, image_path, image_base64)
+        image_notes = self._build_image_context_notes(image_url, image_path, image_base64)
         at_note = self._format_at_note(at_qqs, at_all)
         target_note = f"目标会话: {session_id}"
         if at_note:
             target_note += f"\n目标提及: {at_note}"
         image_note = ""
-        if image_parts:
-            image_note = f"\n图片数量: {len(image_parts)}"
         if image_notes:
             image_note += "\n" + "\n".join(image_notes)
         bridge_text = (
@@ -370,13 +349,9 @@ class GossipSharer(Star):
             f"{target_note}{image_note}\n"
             f"转发内容:\n{content or '[无文字内容]'}"
         )
-        if image_parts:
-            user_content = [{"type": "text", "text": bridge_text}, *image_parts]
-        else:
-            user_content = bridge_text
         user_message = {
             "role": "user",
-            "content": user_content,
+            "content": bridge_text,
         }
         assistant_message = {
             "role": "assistant",
@@ -810,6 +785,9 @@ class GossipSharer(Star):
         task_payload: dict,
     ) -> AstrMessageEvent:
         target_id = str(task_payload.get("target_id") or "").strip()
+        target_type = self._normalize_target_type_name(
+            task_payload.get("target_type"), "GroupMessage"
+        )
         requester_id = str(task_payload.get("requester_id") or "").strip()
         requester_name = str(task_payload.get("requester_name") or requester_id or "跨会话任务").strip()
         self_id = await self._resolve_qq_self_id(platform)
@@ -822,13 +800,22 @@ class GossipSharer(Star):
         message.raw_message = None
         message.message_str = task_text
         message.message = []
-        if self_id:
+        if target_type == "GroupMessage" and self_id:
             message.message.append(At(qq=self_id, name=""))
         message.message.append(Plain(task_text))
-        message.type = MessageType.GROUP_MESSAGE
-        message.group_id = target_id
-        message.group = Group(group_id=target_id)
-        message.sender = MessageMember(user_id=requester_id, nickname=requester_name)
+        if target_type == "GroupMessage":
+            message.type = MessageType.GROUP_MESSAGE
+            message.group_id = target_id
+            message.group = Group(group_id=target_id)
+            message.sender = MessageMember(
+                user_id=requester_id, nickname=requester_name
+            )
+        else:
+            message.type = MessageType.FRIEND_MESSAGE
+            message.group = None
+            # Private-session routing is derived from the synthetic sender ID.
+            # The original requester remains available in DELEGATED_TASK_EXTRA.
+            message.sender = MessageMember(user_id=target_id, nickname=target_id)
         message.session_id = target_id
 
         target_event = platform.create_event(message)
@@ -880,10 +867,10 @@ class GossipSharer(Star):
             return "唤醒失败：task 不能为空。"
         if not platform_id:
             return "唤醒失败：未配置默认平台 ID，也无法从当前 QQ 事件推断目标平台。"
-        if target_type != "GroupMessage":
-            return "唤醒失败：当前目标会话任务只开放 QQ 群目标。"
+        if target_type not in ("GroupMessage", "FriendMessage"):
+            return "唤醒失败：target_type 只允许为 FriendMessage 或 GroupMessage。"
 
-        error = self._validate_target("GroupMessage", target_id, platform_id)
+        error = self._validate_target(target_type, target_id, platform_id)
         if error:
             return error.replace("发送失败：", "唤醒失败：", 1)
 
@@ -1082,18 +1069,18 @@ class GossipSharer(Star):
         target_platform: str = None,
     ):
         """
-        【目标 QQ 会话 LLM 唤醒/委派工具】把一项自然语言任务投递到指定 QQ 群，
-        让目标群自己的 LLM 在目标群上下文里醒来并处理。
+        【目标 QQ 会话 LLM 唤醒/委派工具】把一项自然语言任务投递到指定 QQ 群或私聊，
+        让目标会话自己的 LLM 在对应上下文里醒来并处理。
 
-        重要：这是通用的跨群委派入口。用户想让你“去另一个群里做点什么”时优先考虑本工具，
-        包括传话、打小报告、转述当前会话发生的事、请目标群回应、让目标群 Bot 处理群内事务、
+        重要：这是通用的跨会话委派入口。用户想让你“去另一个群或私聊里做点什么”时优先考虑本工具，
+        包括传话、打小报告、转述当前会话发生的事、请目标会话回应、让目标 Bot 处理会话事务、
         解禁/禁言/查询/提醒/协调等需要目标会话自己判断和执行的任务。
 
         选择边界：
-        - 只是单向发送一段确定内容，不需要目标群 LLM 判断或回应时，用 send_cross_message。
-        - 需要目标群 LLM 结合目标群上下文、目标群工具和目标群权限来处理时，用本工具。
-        - task 必须写清楚要交给目标群 LLM 的完整任务；跨会话信息、要转述的话、打小报告的内容、
-          请求者希望目标群怎么处理，都应直接写进 task，不能假设目标群 LLM 能看到当前会话全文。
+        - 只是单向发送一段确定内容，不需要目标会话 LLM 判断或回应时，用 send_cross_message。
+        - 需要目标 LLM 结合目标会话上下文、工具和权限来处理时，用本工具。
+        - task 必须写清楚要交给目标 LLM 的完整任务；跨会话信息、要转述的话、打小报告的内容、
+          请求者希望目标会话怎么处理，都应直接写进 task，不能假设目标 LLM 能看到当前会话全文。
 
         典型使用场景：
         1. 用户说“去群 984252223 解禁我”：target_id='984252223', task='帮请求者解除禁言'。
@@ -1101,11 +1088,12 @@ class GossipSharer(Star):
         3. 用户说“去那个群打个小报告，说刚才 A 又在阴阳怪气”：target_id='目标群号', task='向当前目标群打小报告：刚才 A 又在阴阳怪气，请你根据目标群语境自然回应。'。
         4. 用户说“去群里问问他们明天几点集合”：target_id='目标群号', task='询问当前目标群成员明天几点集合，并等待他们回应。'。
         5. 用户说“把姐姐刚才的话转给群里，让他们自己看着办”：target_id='目标群号', task='向当前目标群转述：<姐姐刚才的话>。请根据当前目标群语境自然处理。'。
+        6. 用户说“去私聊问姐姐怎么看”：target_type='FriendMessage', target_id='<姐姐QQ>', task='请根据当前私聊上下文回应：你怎么看这件事？'。
 
         Args:
-            target_id (str): 目标 QQ 群号。必须在群白名单中。
+            target_id (str): 目标 QQ 群号或好友 QQ。群目标必须在白名单中；私聊目标遵循私聊安全配置。
             task (str): 要交给目标会话 LLM 执行的自然语言任务，需保留用户原意和必要上下文。
-            target_type (str): 目标会话类型。当前只开放 GroupMessage，默认 GroupMessage。
+            target_type (str): 目标会话类型。支持 GroupMessage 和 FriendMessage，默认 GroupMessage。
             target_platform (str): 可选。QQ 平台 ID。默认使用 default_platform；未配置时尝试使用当前 QQ 平台。
         """
         try:
