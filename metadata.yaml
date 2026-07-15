@@ -2,7 +2,7 @@ name: astrbot_plugin_gossip_sharer
 display_name: 跨会话消息传递
 desc: 拟人化跨 Session 行动工具，支持 QQ 群聊/私聊 LLM 唤醒及 Bot 主动选择图片和文件。
 help: 支持工具：wake_qq_session_task, get_available_groups, get_friend_list, get_target_group_members
-version: v1.8.0
+version: v1.8.1
 author: TenmaGabriel0721
 repo: https://github.com/TenmaGabriel0721/astrbot_plugin_gossip_sharer
 priority: 10

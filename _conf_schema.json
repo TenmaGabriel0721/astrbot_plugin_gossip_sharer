@@ -101,8 +101,19 @@
     },
     "guarantee_threshold": {
         "type": "int",
-        "default": 5,
+        "default": 10,
         "description": "未分享提醒阈值",
-        "hint": "每个来源会话连续多少次未成功执行跨会话行动后，向 LLM 注入一次是否需要分享的提醒。小于或等于 0 时关闭；达到阈值后不会持续重复提醒。"
+        "hint": "每个来源会话连续多少次 LLM 请求未成功执行跨会话行动后，提醒 Bot 主动回顾是否有值得分享、转述或邀请回应的内容。达到阈值后会立即重新计数并进入下一周期；小于或等于 0 时关闭。"
+    },
+    "guarantee_injection_method": {
+        "type": "string",
+        "default": "extra_user_content",
+        "description": "主动提醒注入位置",
+        "hint": "三种方式都不会修改 system prompt 或把提醒写入历史。extra_user_content（推荐）：作为当前轮临时用户内容追加，兼容性最好且最利于前缀缓存。user_message_before：在本轮请求中放在用户原话前面，提醒更醒目。user_message_after：在本轮请求中放在用户原话后面，位置最近但更容易影响模型对用户原意的关注。",
+        "options": [
+            "extra_user_content",
+            "user_message_before",
+            "user_message_after"
+        ]
     }
 }

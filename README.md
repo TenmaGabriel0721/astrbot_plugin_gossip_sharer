@@ -13,6 +13,7 @@
 - **群聊白名单**：`GroupMessage` 目标必须在群白名单内。
 - **软白名单联动**：自动读取 `astrbot_plugin_soft_whitelist_config.json` 的 `group_whitelist`，并与本插件配置的 `group_whitelist` 合并去重。
 - **保底提示**：按来源会话独立统计连续未分享次数，达到阈值时提示 Bot 自主判断是否通过 wake 去姐姐私聊。
+- **主动社交引导**：趣事、吐槽、告状、转达、邀请回应或附件分享都可由 Bot 自主发起，不必等待用户明确要求转发。
 - **内部发送层**：原 `send_cross_message` 保留为插件内部图片、文件及故障兜底能力，不再暴露给 LLM。
 - **列表查询**：支持尝试读取群列表、好友列表和目标群成员列表；平台不支持时返回降级说明。
 
@@ -37,7 +38,8 @@
 | `max_wake_total_mb` | int | 单次所有附件合计大小上限。 |
 | `max_source_message_chars` | int | 自动提供给目标 LLM 的来源消息最大长度，`0` 表示不附带。 |
 | `attachment_allowed_roots` | list | 除默认 temp/workspaces 外，允许发送本地生成文件的额外安全目录。 |
-| `guarantee_threshold` | int | 连续多少次 LLM 请求未成功转发后，注入一次保底提示；按来源会话独立计数，小于等于 0 表示关闭。 |
+| `guarantee_threshold` | int | 每个来源会话连续多少次 LLM 请求未发起跨会话行动后提醒一次；触发后重新计数，默认 10，小于等于 0 表示关闭。 |
+| `guarantee_injection_method` | string | 主动社交提醒的注入位置：`extra_user_content`（推荐）、`user_message_before` 或 `user_message_after`。 |
 
 > 建议首次安装后手动配置 `default_platform` 与 `sister_qq`。插件不再内置固定平台 ID 或固定 QQ 号，避免复制部署时误发。
 
@@ -61,6 +63,7 @@
 选择边界：
 
 - 所有正常跨会话行为统一使用 `wake_qq_session_task`。
+- `wake_qq_session_task` 是 Bot 的主动社交能力；遇到值得告诉其他会话的内容时，可以结合人设和关系自主调用，不必等待用户明确说“转发”。
 - `task` 要写清楚目标 LLM 应完成的行动；插件会自动补充来源会话、请求者和原始消息。
 - 只有确实要把附件发过去时才传 `image_refs` 或 `file_refs`；未选择的附件不会自动发送。
 - At 和群管理不使用 wake 参数硬编码，由目标 LLM 查询目标群成员后自行调用工具。
@@ -141,9 +144,13 @@ file_1: 当前消息中的第一个文件
 - 按来源会话（`event.unified_msg_origin`）独立计数。
 - 每次 LLM 请求计数 +1。
 - `wake_qq_session_task` 成功投递后，只清零当前来源会话的计数。
-- 达到 `guarantee_threshold` 时，把提示追加到 `system_prompt`。
-- 达到阈值后只注入一次提示，不会在后续每次请求持续重复注入。
+- 达到 `guarantee_threshold` 时，把一次性提醒追加到当前轮用户内容，不修改 `system_prompt`，避免破坏模型的系统提示缓存命中。
+- 达到阈值后立即将当前会话计数归零，进入下一提醒周期。
+- 默认阈值为 10；例如持续没有 wake 时，会在第 10、20、30 次请求分别重新提醒。
 - 提示只引导模型考虑是否分享，不会直接替模型发送消息。
+- 提醒注入位置可选择：`extra_user_content` 作为不落历史的临时用户内容；`user_message_before` 在本轮请求中放在用户原话前；`user_message_after` 在本轮请求中放在用户原话后。三种方式都不会把提醒写入长期历史。
+- `extra_user_content` 最利于保持前缀缓存和用户原话完整，因此作为默认推荐。
+- 附件短引用目录同样使用当前轮临时用户内容注入，不写入长期历史，也不动态修改系统提示。
 
 ## 附件处理与安全
 

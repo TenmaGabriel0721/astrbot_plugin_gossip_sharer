@@ -14,13 +14,14 @@ from astrbot.api.message_components import At, File, Image, Plain, Reply
 from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.astrbot_path import (
     get_astrbot_temp_path,
     get_astrbot_workspaces_path,
 )
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.8.1"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 ATTACHMENT_REGISTRY_EXTRA = "gossip_sharer_attachment_registry"
@@ -67,7 +68,20 @@ class GossipSharer(Star):
         )
         self.group_whitelist = []
         self._load_group_whitelist()
-        self.guarantee_threshold = int(self.config.get("guarantee_threshold", 5))
+        self.guarantee_threshold = int(self.config.get("guarantee_threshold", 10))
+        self.guarantee_injection_method = str(
+            self.config.get("guarantee_injection_method", "extra_user_content")
+        ).strip()
+        if self.guarantee_injection_method not in {
+            "extra_user_content",
+            "user_message_before",
+            "user_message_after",
+        }:
+            logger.warning(
+                "未知的主动社交提醒注入位置 "
+                f"{self.guarantee_injection_method}，已回退到 extra_user_content"
+            )
+            self.guarantee_injection_method = "extra_user_content"
         self.no_share_counts: dict[str, int] = {}
 
         if not self.default_platform:
@@ -82,7 +96,8 @@ class GossipSharer(Star):
         logger.info(
             f"转发告状工具 v{PLUGIN_VERSION} 已加载。姐姐: {self.sister_qq or '未配置'}，"
             f"默认平台: {self.default_platform or '未配置'}，白名单群数量: {len(self.group_whitelist)}，"
-            f"保底阈值: {self.guarantee_threshold}，任意私聊目标: {self.enable_arbitrary_friend_targets}，"
+            f"保底阈值/注入位置: {self.guarantee_threshold}/{self.guarantee_injection_method}，"
+            f"任意私聊目标: {self.enable_arbitrary_friend_targets}，"
             f"目标会话任务唤醒: {self.enable_target_session_tasks}，"
             f"唤醒图片/文件: {self.enable_wake_images}/{self.enable_wake_files}"
         )
@@ -1337,17 +1352,25 @@ class GossipSharer(Star):
         return "目标群成员列表：\n" + "\n".join(lines) + extra
 
     def _build_guarantee_prompt(self, count: int) -> str:
-        if not self.sister_qq:
-            return (
-                f"已经连续 {count} 次未主动分享消息。"
-                "但当前未配置 sister_qq，请不要调用 wake_qq_session_task 进行默认私聊告状。"
-            )
+        target_hint = (
+            f"你可以优先考虑联系姐姐({self.sister_qq})的私聊会话，"
+            "也可以选择与内容和关系更匹配的白名单群或允许的好友会话。"
+            if self.sister_qq
+            else "请选择与内容和关系匹配的白名单群或允许的好友会话。"
+        )
         return (
-            f"已经连续 {count} 次未主动分享消息。"
-            f"请你现在根据当前上下文，判断是否需要给姐姐({self.sister_qq})打个小报告。"
-            f"如果要分享，请调用工具 `wake_qq_session_task`，"
-            f"参数建议为 target_type='FriendMessage'、target_id='{self.sister_qq}'，"
-            "并在 task 中写清楚希望姐姐私聊会话里的你如何自然表达和处理。"
+            "[插件临时上下文｜非用户原话]\n"
+            "以下内容仅用于帮助你自主判断，不代表当前用户提出了转发要求，"
+            "也不要向用户复述本段内容。\n"
+            "[主动社交提醒]\n"
+            f"当前会话已经连续 {count} 次 LLM 请求没有发起跨会话行动。"
+            "请回顾近期对话中是否出现了值得分享的趣事、吐槽、告状、请求转达、"
+            "邀请他人回应，或适合发送的图片和文件。"
+            "如果符合你的人设、关系和当下语境，可以主动调用 `wake_qq_session_task`，"
+            "不必等待用户明确说出“转发”“告诉她”或“发过去”。"
+            f"{target_hint}"
+            "请在 task 中写清目标会话里的你应如何自然表达和处理；"
+            "如果确实没有值得分享的内容，正常回复即可，不要提及这条内部提醒。"
         )
 
     def _build_target_task_text(self, task_payload: dict) -> str:
@@ -1767,6 +1790,9 @@ class GossipSharer(Star):
         """
         将任务委派给指定 QQ 群聊或私聊的目标 LLM。
 
+        这是 Bot 的主动跨会话社交能力，不只是被动转发工具。当当前会话出现值得告诉
+        其他人的趣事、吐槽、告状、请求转达、邀请回应或适合分享的图片和文件时，
+        可以结合人设、关系和目标会话语境自主调用，不必等待用户明确要求“转发”。
         目标 LLM 会读取目标会话上下文，并自行说话、查询成员、At 或调用工具。
         task 必须写清楚目标会话要完成的事情。只有确实要把附件发过去时，
         才传入当前提示中列出的 image_refs 或 file_refs；未选择的附件不会自动发送。
@@ -1804,10 +1830,8 @@ class GossipSharer(Star):
         registry = self._ensure_attachment_registry(event, req.image_urls)
         attachment_catalog = self._format_attachment_catalog(registry)
         if attachment_catalog:
-            req.system_prompt = (
-                f"{req.system_prompt}\n\n{attachment_catalog}"
-                if req.system_prompt
-                else attachment_catalog
+            req.extra_user_content_parts.append(
+                TextPart(text=attachment_catalog).mark_as_temp()
             )
 
         if self.guarantee_threshold <= 0:
@@ -1816,13 +1840,36 @@ class GossipSharer(Star):
         event_key = self._event_key(event)
         count = self.no_share_counts.get(event_key, 0) + 1
         self.no_share_counts[event_key] = count
-        if count != self.guarantee_threshold:
+        if count < self.guarantee_threshold:
             return
 
+        self.no_share_counts[event_key] = 0
         prompt = self._build_guarantee_prompt(count)
-        req.system_prompt = (
-            f"{req.system_prompt}\n\n{prompt}" if req.system_prompt else prompt
-        )
+        reminder_part = TextPart(text=prompt).mark_as_temp()
+        if self.guarantee_injection_method in {
+            "user_message_before",
+            "user_message_after",
+        }:
+            original_prompt = str(req.prompt or "")
+            existing_parts = list(req.extra_user_content_parts or [])
+            user_part = [TextPart(text=original_prompt)] if original_prompt else []
+            req.prompt = None
+            if self.guarantee_injection_method == "user_message_before":
+                req.extra_user_content_parts = [
+                    reminder_part,
+                    *user_part,
+                    *existing_parts,
+                ]
+            else:
+                req.extra_user_content_parts = [
+                    *user_part,
+                    reminder_part,
+                    *existing_parts,
+                ]
+        else:
+            req.extra_user_content_parts.append(reminder_part)
         logger.info(
-            f"已为会话 {event_key} 触发一次保底提示，提示 Bot 自主决定是否调用 wake_qq_session_task"
+            f"已为会话 {event_key} 触发周期性主动社交提示并重新计数，"
+            f"注入位置={self.guarantee_injection_method}，"
+            "提示 Bot 自主决定是否调用 wake_qq_session_task"
         )
