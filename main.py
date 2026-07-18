@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import mimetypes
 import os
@@ -8,11 +10,13 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
+from PIL import Image as PILImage
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, File, Image, Plain, Reply
 from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.astrbot_path import (
@@ -21,7 +25,7 @@ from astrbot.core.utils.astrbot_path import (
 )
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
-PLUGIN_VERSION = "1.8.1"
+PLUGIN_VERSION = "1.8.2"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 ATTACHMENT_REGISTRY_EXTRA = "gossip_sharer_attachment_registry"
@@ -500,6 +504,7 @@ class GossipSharer(Star):
         lines = [
             "[可携带到目标 QQ 会话的附件]",
             "只有确实需要发送时，才把下面的短引用传给 wake_qq_session_task。",
+            "消息或引用图片必须使用 image_1 这类短引用；不要复用历史中的 /data/temp/media_image_* 临时路径。",
         ]
         for ref_id, item in registry.items():
             kind_name = "图片" if item["kind"] == "image" else "文件"
@@ -520,6 +525,32 @@ class GossipSharer(Star):
 
         refs = self._normalize_string_list(value, split_whitespace=False)
         return list(dict.fromkeys(refs))
+
+    def _prepare_image_for_llm(self, encoded: str) -> tuple[str | None, bool, str]:
+        """Convert GIF data to a static PNG for LLM-compatible recognition.
+
+        Args:
+            encoded: Raw base64 image data without a URI prefix.
+
+        Returns:
+            LLM-safe base64 data, whether the original is GIF, and an error message.
+        """
+
+        try:
+            raw = base64.b64decode(encoded)
+        except Exception as e:
+            return None, False, f"base64 解码失败: {e}"
+        if not raw.startswith((b"GIF87a", b"GIF89a")):
+            return encoded, False, ""
+        try:
+            with PILImage.open(io.BytesIO(raw)) as image:
+                image.seek(0)
+                frame = image.convert("RGBA")
+                output = io.BytesIO()
+                frame.save(output, format="PNG")
+            return base64.b64encode(output.getvalue()).decode(), True, ""
+        except Exception as e:
+            return None, True, f"GIF 首帧转换失败: {e}"
 
     def _allowed_attachment_paths(self) -> list[Path]:
         """Return local roots permitted for model-selected generated files.
@@ -626,6 +657,33 @@ class GossipSharer(Star):
         for ref in normalized_images:
             try:
                 entry = self._find_attachment_entry(registry, ref, "image")
+                if not entry:
+                    image_entries = [
+                        item
+                        for item in registry.values()
+                        if item.get("kind") == "image"
+                    ]
+                    is_stale_astrbot_temp = False
+                    if not ref.startswith(
+                        ("http://", "https://", "base64://", "data:")
+                    ):
+                        local_ref = file_uri_to_path(ref) if is_file_uri(ref) else ref
+                        candidate = Path(local_ref).expanduser().resolve()
+                        try:
+                            candidate.relative_to(
+                                Path(get_astrbot_temp_path()).resolve()
+                            )
+                            is_stale_astrbot_temp = candidate.name.startswith(
+                                "media_image_"
+                            )
+                        except ValueError:
+                            pass
+                    if is_stale_astrbot_temp and len(image_entries) == 1:
+                        entry = image_entries[0]
+                        logger.info(
+                            f"失效的临时图片引用 {ref} 已回退到本轮唯一图片 "
+                            f"{entry['id']}"
+                        )
                 if entry:
                     component = entry["component"]
                     name = entry["name"]
@@ -642,15 +700,40 @@ class GossipSharer(Star):
                     component = Image.fromFileSystem(str(path))
                     name = path.name
 
-                encoded = await component.convert_to_base64()
+                encoded = (
+                    entry.get("snapshot_base64") if entry else None
+                ) or await component.convert_to_base64()
                 size = len(encoded) * 3 // 4
                 if size > self.max_wake_image_mb * 1024 * 1024:
                     raise ValueError(f"超过单张图片 {self.max_wake_image_mb} MB 限制")
                 if total_bytes + size > total_limit:
                     raise ValueError(f"超过附件总大小 {self.max_wake_total_mb} MB 限制")
                 total_bytes += size
+                llm_encoded = entry.get("llm_snapshot_base64") if entry else None
+                is_gif = bool(entry.get("is_gif")) if entry else False
+                llm_error = str(entry.get("llm_snapshot_error") or "") if entry else ""
+                if llm_encoded is None and not llm_error:
+                    llm_encoded, is_gif, llm_error = self._prepare_image_for_llm(
+                        encoded
+                    )
+                if llm_encoded and len(llm_encoded) * 3 // 4 > (
+                    self.max_wake_image_mb * 1024 * 1024
+                ):
+                    llm_encoded = None
+                    llm_error = "GIF 首帧 PNG 超过单张图片识别大小限制"
+                if llm_error:
+                    failures.append(
+                        f"图片 {ref} 的 LLM 识别副本: {llm_error}；仍会发送原图"
+                    )
                 images.append(
-                    {"ref": ref, "name": name, "base64": encoded, "size": size}
+                    {
+                        "ref": ref,
+                        "name": name,
+                        "base64": encoded,
+                        "llm_base64": llm_encoded,
+                        "is_gif": is_gif,
+                        "size": size,
+                    }
                 )
             except Exception as e:
                 failures.append(f"图片 {ref}: {e}")
@@ -784,8 +867,11 @@ class GossipSharer(Star):
             lines.append(f"附件投递状态: {delivery_text}")
         if delivered is not False:
             for image in images:
+                recognition_note = (
+                    "，目标 LLM 使用首帧 PNG 识别" if image.get("is_gif") else ""
+                )
                 lines.append(
-                    f"- 图片: {image['name']} ({image['size'] / 1024 / 1024:.2f} MB)"
+                    f"- 图片: {image['name']} ({image['size'] / 1024 / 1024:.2f} MB{recognition_note})"
                 )
             for file_info in files:
                 lines.append(
@@ -1399,6 +1485,15 @@ class GossipSharer(Star):
             lines.extend(["原始消息:", source_message])
         if attachment_summary:
             lines.extend(["附件信息:", attachment_summary])
+        if task_payload.get("has_pending_attachments"):
+            lines.extend(
+                [
+                    "附件执行规则:",
+                    "插件已经锁定并保存了本次选中的原始附件，会在本次行动完成时自动投递。",
+                    "不要调用 search_meme、send_message_to_user、图片搜索或其他发送工具来寻找、替换、补发这些附件。",
+                    "你只需完成文字、At、群管理等其余行动；如果任务明确要求纯附件且不要文字，可以保持最终回复为空。",
+                ]
+            )
         lines.extend(
             [
                 "行动目标:",
@@ -1560,6 +1655,7 @@ class GossipSharer(Star):
             "source_platform": getattr(event, "get_platform_id", lambda: "")(),
             "source_message": getattr(event, "get_message_str", lambda: "")(),
             "attachment_summary": attachment_summary,
+            "has_pending_attachments": bool(prepared["images"] or prepared["files"]),
             "origin": "gossip_sharer",
         }
 
@@ -1567,7 +1663,11 @@ class GossipSharer(Star):
             target_event = await self._build_qq_task_wake_event(
                 platform,
                 task_payload,
-                [image["base64"] for image in prepared["images"]],
+                [
+                    image["llm_base64"]
+                    for image in prepared["images"]
+                    if image.get("llm_base64")
+                ],
             )
             target_event.set_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, prepared)
             for cleanup_path in prepared.get("cleanup_paths", []):
@@ -1593,6 +1693,58 @@ class GossipSharer(Star):
         if attachment_summary:
             result += f"\n{attachment_summary}"
         return result
+
+    @filter.on_agent_done(priority=1000)
+    async def send_pending_wake_attachments_for_empty_reply(
+        self,
+        event: AstrMessageEvent,
+        run_context,
+        response: LLMResponse | None,
+    ) -> None:
+        """Deliver pending attachments when the final agent reply is empty.
+
+        Args:
+            event: Synthetic target-session event.
+            run_context: Completed agent run context.
+            response: Final response produced by the target agent.
+        """
+
+        if (
+            not self._is_synthetic_event(event)
+            or response is None
+            or getattr(response, "role", "") != "assistant"
+        ):
+            return
+        prepared = event.get_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, None)
+        if not isinstance(prepared, dict) or event.get_extra(
+            WAKE_ATTACHMENTS_SENT_EXTRA, False
+        ):
+            return
+        result_chain = getattr(response, "result_chain", None)
+        if result_chain and getattr(result_chain, "chain", None):
+            return
+        if str(getattr(response, "completion_text", "") or "").strip():
+            return
+
+        event.set_extra(WAKE_ATTACHMENTS_SENT_EXTRA, True)
+        session_id = str(
+            event.get_extra("gossip_sharer_target_session", "") or ""
+        ).strip()
+        if not session_id:
+            logger.warning("目标 QQ 会话最终回复为空，但缺少附件投递会话 ID")
+            return
+        try:
+            delivered = await self._send_wake_attachments(session_id, prepared)
+            if not delivered and (prepared.get("images") or prepared.get("files")):
+                logger.warning(f"目标平台未接受空回复兜底附件消息: {session_id}")
+                return
+            if prepared.get("images") or prepared.get("files"):
+                logger.info(f"目标会话空回复兜底附件已投递: target={session_id}")
+        except Exception as e:
+            logger.warning(
+                f"目标 QQ 会话空回复兜底附件投递失败: target={session_id}, error={e}",
+                exc_info=True,
+            )
 
     @filter.after_message_sent(priority=1000)
     async def send_pending_wake_attachments(self, event: AstrMessageEvent) -> None:
@@ -1803,7 +1955,7 @@ class GossipSharer(Star):
             task (str): 目标 LLM 要完成的自然语言行动。
             target_type (str): 目标会话类型。支持 GroupMessage 和 FriendMessage，默认 GroupMessage。
             target_platform (str): 可选。QQ 平台 ID。默认使用 default_platform；未配置时尝试使用当前 QQ 平台。
-            image_refs (list[string]): 可选。要主动发送的图片短引用、允许路径、URL 或 base64 引用。
+            image_refs (list[string]): 可选。要主动发送的图片引用。当前消息或引用图片必须优先使用 image_1 这类短引用，不要复用历史中的 media_image 临时路径；也支持仍然有效的允许路径、URL 或 base64。
             file_refs (list[string]): 可选。要主动发送的文件短引用、允许路径或 HTTP/HTTPS URL。
         """
         try:
@@ -1828,6 +1980,58 @@ class GossipSharer(Star):
             return
 
         registry = self._ensure_attachment_registry(event, req.image_urls)
+        snapshotted = 0
+        for item in registry.values():
+            if item.get("kind") != "image" or item.get("snapshot_base64"):
+                continue
+            if snapshotted >= self.max_wake_images:
+                break
+            try:
+                encoded = await item["component"].convert_to_base64()
+                size = len(encoded) * 3 // 4
+                if size > self.max_wake_image_mb * 1024 * 1024:
+                    continue
+                item["snapshot_base64"] = encoded
+                item["snapshot_size"] = size
+                llm_encoded, is_gif, llm_error = self._prepare_image_for_llm(encoded)
+                item["llm_snapshot_base64"] = llm_encoded
+                item["llm_snapshot_error"] = llm_error
+                item["is_gif"] = is_gif
+                snapshotted += 1
+            except Exception as e:
+                logger.debug(f"提前快照附件图片失败 {item.get('id')}: {e}")
+
+        llm_image_urls = []
+        for image_ref in req.image_urls:
+            entry = self._find_attachment_entry(registry, str(image_ref), "image")
+            if entry and entry.get("is_gif"):
+                llm_encoded = entry.get("llm_snapshot_base64")
+                if llm_encoded:
+                    llm_image_urls.append(f"base64://{llm_encoded}")
+                else:
+                    logger.warning(
+                        f"GIF {entry.get('id')} 无法生成 LLM 识别首帧，"
+                        "已从本次 LLM 图片输入中移除，但仍可通过 wake 发送原图"
+                    )
+                continue
+            if entry:
+                llm_image_urls.append(image_ref)
+                continue
+            try:
+                encoded = await Image(file=str(image_ref)).convert_to_base64()
+                llm_encoded, is_gif, llm_error = self._prepare_image_for_llm(encoded)
+                if is_gif:
+                    if llm_encoded:
+                        llm_image_urls.append(f"base64://{llm_encoded}")
+                    else:
+                        logger.warning(
+                            f"GIF 图片无法生成 LLM 识别首帧，已忽略本次识别输入: {llm_error}"
+                        )
+                    continue
+            except Exception:
+                pass
+            llm_image_urls.append(image_ref)
+        req.image_urls = llm_image_urls
         attachment_catalog = self._format_attachment_catalog(registry)
         if attachment_catalog:
             req.extra_user_content_parts.append(
