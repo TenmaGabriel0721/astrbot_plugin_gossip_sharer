@@ -1,4 +1,6 @@
 import base64
+import copy
+import hashlib
 import io
 import json
 import mimetypes
@@ -14,7 +16,16 @@ from PIL import Image as PILImage
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain, Reply
+from astrbot.api.message_components import (
+    At,
+    File,
+    Forward,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+    Reply,
+)
 from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
@@ -25,12 +36,17 @@ from astrbot.core.utils.astrbot_path import (
 )
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
-PLUGIN_VERSION = "1.8.2"
+PLUGIN_VERSION = "1.9.3"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 ATTACHMENT_REGISTRY_EXTRA = "gossip_sharer_attachment_registry"
+FORWARD_REGISTRY_EXTRA = "gossip_sharer_forward_registry"
+CAPTURED_FORWARD_SOURCES_EXTRA = "gossip_sharer_captured_forward_sources"
 PENDING_WAKE_ATTACHMENTS_EXTRA = "gossip_sharer_pending_wake_attachments"
 WAKE_ATTACHMENTS_SENT_EXTRA = "gossip_sharer_wake_attachments_sent"
+
+FORWARD_CAPTURE_TTL_SECONDS = 180
+FORWARD_CAPTURE_MAX_MESSAGES = 30
 
 
 @register(
@@ -55,11 +71,20 @@ class GossipSharer(Star):
         self.enable_wake_files = self._normalize_bool(
             self.config.get("enable_wake_files", True)
         )
+        self.enable_wake_forwards = self._normalize_bool(
+            self.config.get("enable_wake_forwards", True)
+        )
         self.allow_remote_attachment_urls = self._normalize_bool(
             self.config.get("allow_remote_attachment_urls", True)
         )
         self.max_wake_images = self._config_int("max_wake_images", 4, minimum=0)
         self.max_wake_files = self._config_int("max_wake_files", 3, minimum=0)
+        self.max_wake_forwards = self._config_int(
+            "max_wake_forwards", 10, minimum=0, maximum=50
+        )
+        self.max_forward_nodes = self._config_int(
+            "max_forward_nodes", 50, minimum=1, maximum=200
+        )
         self.max_wake_image_mb = self._config_int("max_wake_image_mb", 15, minimum=1)
         self.max_wake_file_mb = self._config_int("max_wake_file_mb", 50, minimum=1)
         self.max_wake_total_mb = self._config_int("max_wake_total_mb", 100, minimum=1)
@@ -87,6 +112,7 @@ class GossipSharer(Star):
             )
             self.guarantee_injection_method = "extra_user_content"
         self.no_share_counts: dict[str, int] = {}
+        self._captured_forward_sources: dict[str, dict] = {}
 
         if not self.default_platform:
             logger.warning(
@@ -103,8 +129,12 @@ class GossipSharer(Star):
             f"保底阈值/注入位置: {self.guarantee_threshold}/{self.guarantee_injection_method}，"
             f"任意私聊目标: {self.enable_arbitrary_friend_targets}，"
             f"目标会话任务唤醒: {self.enable_target_session_tasks}，"
-            f"唤醒图片/文件: {self.enable_wake_images}/{self.enable_wake_files}"
+            f"唤醒图片/文件/合并记录: "
+            f"{self.enable_wake_images}/{self.enable_wake_files}/{self.enable_wake_forwards}"
         )
+
+    async def terminate(self):
+        self._captured_forward_sources.clear()
 
     def _soft_whitelist_config_path(self) -> str:
         return os.path.abspath(
@@ -378,6 +408,1061 @@ class GossipSharer(Star):
         }
         return mapping.get(text.lower(), text)
 
+    def _is_qq_source_event(self, event: AstrMessageEvent | None) -> bool:
+        if event is None:
+            return False
+        try:
+            return event.get_platform_name() == "aiocqhttp"
+        except Exception:
+            return False
+
+    def _event_message_id(self, event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", None)
+        if message_id is None:
+            raw = getattr(message_obj, "raw_message", None)
+            if isinstance(raw, dict):
+                message_id = raw.get("message_id")
+        return str(message_id or "").strip()
+
+    def _normalize_forward_time(self, value, default=None) -> str:
+        candidate = value if value not in (None, "") else default
+        if candidate in (None, ""):
+            return ""
+        try:
+            timestamp = int(float(candidate))
+        except (TypeError, ValueError):
+            return ""
+        if timestamp > 100_000_000_000:
+            timestamp //= 1000
+        return str(timestamp) if timestamp > 0 else ""
+
+    def _event_timestamp(self, event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        message_obj = getattr(event, "message_obj", None)
+        timestamp = getattr(message_obj, "timestamp", None)
+        raw = getattr(message_obj, "raw_message", None)
+        if timestamp in (None, "") and isinstance(raw, dict):
+            timestamp = raw.get("time") or raw.get("timestamp")
+        return self._normalize_forward_time(timestamp)
+
+    def _event_raw_segments(self, event: AstrMessageEvent | None) -> list[dict]:
+        if event is None:
+            return []
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not isinstance(raw, dict):
+            return []
+        segments = raw.get("message")
+        if not isinstance(segments, list):
+            return []
+        return [copy.deepcopy(item) for item in segments if isinstance(item, dict)]
+
+    def _extract_forward_ids_from_segments(self, segments) -> list[str]:
+        ids = []
+        for segment in segments or []:
+            if not isinstance(segment, dict):
+                continue
+            seg_type = str(segment.get("type") or "").lower()
+            data = segment.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            if seg_type in {"forward", "forward_msg"}:
+                forward_id = str(
+                    data.get("id") or data.get("message_id") or ""
+                ).strip()
+                if forward_id:
+                    ids.append(forward_id)
+        return list(dict.fromkeys(ids))
+
+    def _extract_forward_components(self, components) -> list[dict]:
+        """Find native or inline merged-forward components recursively."""
+
+        found = []
+        for component in components or []:
+            if isinstance(component, Forward):
+                forward_id = str(getattr(component, "id", "") or "").strip()
+                if forward_id:
+                    found.append({"forward_id": forward_id})
+            elif isinstance(component, Nodes):
+                found.append({"nodes_component": component})
+            elif isinstance(component, Node):
+                found.append({"nodes_component": Nodes([component])})
+            elif isinstance(component, Reply) and component.chain:
+                for item in self._extract_forward_components(component.chain):
+                    found.append({**item, "from_reply": True})
+        return found
+
+    def _build_capture_entries(self, event: AstrMessageEvent) -> list[dict]:
+        """Capture source message IDs before debounce plugins rebuild the event."""
+
+        if not self._is_qq_source_event(event):
+            return []
+        try:
+            if event.get_extra(SYNTHETIC_EVENT_EXTRA, False):
+                return []
+        except Exception:
+            pass
+
+        message_id = self._event_message_id(event)
+        sender_id = str(
+            getattr(event, "get_sender_id", lambda: "")() or ""
+        ).strip()
+        sender_name = str(
+            getattr(event, "get_sender_name", lambda: "")() or sender_id
+        ).strip()
+        source_platform = str(
+            getattr(event, "get_platform_id", lambda: "")() or ""
+        ).strip()
+        message_time = self._event_timestamp(event)
+        raw_segments = self._event_raw_segments(event)
+        components = getattr(event, "get_messages", lambda: [])() or []
+        forward_components = self._extract_forward_components(components)
+        direct_forward_components = [
+            item for item in forward_components if not item.get("from_reply")
+        ]
+        forward_ids = self._extract_forward_ids_from_segments(raw_segments)
+        forward_ids.extend(
+            item["forward_id"]
+            for item in direct_forward_components
+            if item.get("forward_id")
+        )
+        forward_ids = list(dict.fromkeys(forward_ids))
+
+        now = time.monotonic()
+        entries = []
+        for forward_id in forward_ids:
+            entries.append(
+                {
+                    "kind": "forward",
+                    "forward_id": forward_id,
+                    "source_message_id": message_id,
+                    "source": "当前消息",
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "source_platform": source_platform,
+                    "time": message_time,
+                    "captured_at": now,
+                }
+            )
+
+        for item in direct_forward_components:
+            nodes_component = item.get("nodes_component")
+            if nodes_component is None:
+                continue
+            entries.append(
+                {
+                    "kind": "forward",
+                    "nodes_component": nodes_component,
+                    "source_message_id": message_id,
+                    "source": "引用消息" if item.get("from_reply") else "当前消息",
+                    "sender_id": sender_id,
+                    "sender_name": sender_name,
+                    "source_platform": source_platform,
+                    "time": message_time,
+                    "captured_at": now,
+                }
+            )
+
+        raw_has_non_forward = any(
+            str(segment.get("type") or "").lower()
+            not in {"forward", "forward_msg", "reply"}
+            for segment in raw_segments
+        )
+        if message_id or raw_segments:
+            if not forward_ids or raw_has_non_forward:
+                entries.append(
+                    {
+                        "kind": "message",
+                        "message_id": message_id,
+                        "source": "当前消息",
+                        "sender_id": sender_id,
+                        "sender_name": sender_name,
+                        "source_platform": source_platform,
+                        "time": message_time,
+                        "raw_segments": raw_segments,
+                        "raw_has_non_forward": raw_has_non_forward,
+                        "contains_forward": bool(
+                            forward_ids or direct_forward_components
+                        ),
+                        "captured_at": now,
+                    }
+                )
+
+        for component in components:
+            if not isinstance(component, Reply):
+                continue
+            reply_id = str(getattr(component, "id", "") or "").strip()
+            reply_chain = list(component.chain or [])
+            nested_forwards = self._extract_forward_components(reply_chain)
+            for item in nested_forwards:
+                forward_id = str(item.get("forward_id") or "").strip()
+                if forward_id:
+                    entries.append(
+                        {
+                            "kind": "forward",
+                            "forward_id": forward_id,
+                            "source_message_id": reply_id,
+                            "source": "引用消息",
+                            "sender_id": str(
+                                getattr(component, "sender_id", "") or sender_id
+                            ).strip(),
+                            "sender_name": str(
+                                getattr(component, "sender_nickname", "")
+                                or getattr(component, "sender_id", "")
+                                or sender_name
+                            ).strip(),
+                            "source_platform": source_platform,
+                            "time": self._normalize_forward_time(
+                                getattr(component, "time", None), message_time
+                            ),
+                            "captured_at": now,
+                        }
+                    )
+                elif item.get("nodes_component") is not None:
+                    entries.append(
+                        {
+                            "kind": "forward",
+                            "nodes_component": item["nodes_component"],
+                            "source_message_id": reply_id,
+                            "source": "引用消息",
+                            "sender_id": str(
+                                getattr(component, "sender_id", "") or sender_id
+                            ).strip(),
+                            "sender_name": str(
+                                getattr(component, "sender_nickname", "")
+                                or getattr(component, "sender_id", "")
+                                or sender_name
+                            ).strip(),
+                            "source_platform": source_platform,
+                            "time": self._normalize_forward_time(
+                                getattr(component, "time", None), message_time
+                            ),
+                            "captured_at": now,
+                        }
+                    )
+            if reply_id and not nested_forwards:
+                entries.append(
+                    {
+                        "kind": "message",
+                        "message_id": reply_id,
+                        "source": "引用消息",
+                        "sender_id": str(
+                            getattr(component, "sender_id", "") or sender_id
+                        ).strip(),
+                        "sender_name": str(
+                            getattr(component, "sender_nickname", "")
+                            or getattr(component, "sender_id", "")
+                            or sender_name
+                        ).strip(),
+                        "source_platform": source_platform,
+                        "time": self._normalize_forward_time(
+                            getattr(component, "time", None), message_time
+                        ),
+                        "component_chain": reply_chain,
+                        "captured_at": now,
+                    }
+                )
+        return entries
+
+    def _capture_entry_identity(self, entry: dict) -> tuple:
+        kind = str(entry.get("kind") or "")
+        if kind == "forward":
+            forward_id = str(entry.get("forward_id") or "")
+            if forward_id:
+                return kind, forward_id, str(entry.get("source_message_id") or "")
+            return (
+                kind,
+                "inline",
+                str(entry.get("source_message_id") or ""),
+                str(entry.get("source") or ""),
+            )
+        message_id = str(entry.get("message_id") or "")
+        if message_id:
+            return kind, message_id
+        return kind, json.dumps(
+            entry.get("raw_segments") or [], sort_keys=True, default=str
+        )
+
+    def _prune_captured_forward_sources(self) -> None:
+        now = time.monotonic()
+        expired = [
+            key
+            for key, payload in self._captured_forward_sources.items()
+            if now - float(payload.get("updated_at") or 0)
+            > FORWARD_CAPTURE_TTL_SECONDS
+        ]
+        for key in expired:
+            self._captured_forward_sources.pop(key, None)
+
+    def _store_captured_forward_sources(
+        self, event: AstrMessageEvent, entries: list[dict]
+    ) -> None:
+        if not entries:
+            return
+        self._prune_captured_forward_sources()
+        event_key = self._event_key(event)
+        payload = self._captured_forward_sources.setdefault(
+            event_key, {"updated_at": time.monotonic(), "entries": []}
+        )
+        identities = {
+            self._capture_entry_identity(item) for item in payload["entries"]
+        }
+        for entry in entries:
+            identity = self._capture_entry_identity(entry)
+            if identity in identities:
+                continue
+            payload["entries"].append(entry)
+            identities.add(identity)
+        payload["entries"] = payload["entries"][-FORWARD_CAPTURE_MAX_MESSAGES:]
+        payload["updated_at"] = time.monotonic()
+        try:
+            event.set_extra(CAPTURED_FORWARD_SOURCES_EXTRA, list(payload["entries"]))
+        except Exception:
+            pass
+
+    def _ensure_forward_registry(
+        self, event: AstrMessageEvent | None
+    ) -> dict[str, dict]:
+        if event is None:
+            return {}
+        try:
+            existing = event.get_extra(FORWARD_REGISTRY_EXTRA, {})
+        except Exception:
+            existing = {}
+        if isinstance(existing, dict) and existing:
+            return existing
+
+        self._prune_captured_forward_sources()
+        event_key = self._event_key(event)
+        cached_payload = self._captured_forward_sources.pop(event_key, {})
+        entries = list(cached_payload.get("entries") or [])
+        try:
+            entries.extend(
+                event.get_extra(CAPTURED_FORWARD_SOURCES_EXTRA, []) or []
+            )
+        except Exception:
+            pass
+        entries.extend(self._build_capture_entries(event))
+
+        deduped = []
+        identities = set()
+        forward_source_message_ids = {
+            str(item.get("source_message_id") or "").strip()
+            for item in entries
+            if isinstance(item, dict) and item.get("kind") == "forward"
+        }
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if (
+                entry.get("kind") == "message"
+                and str(entry.get("message_id") or "").strip()
+                and str(entry.get("message_id") or "").strip()
+                in forward_source_message_ids
+                and not entry.get("contains_forward")
+            ):
+                continue
+            identity = self._capture_entry_identity(entry)
+            if identity in identities:
+                continue
+            identities.add(identity)
+            deduped.append(entry)
+
+        registry = {}
+        counters = {"forward": 0, "message": 0}
+        message_position = 0
+        current_message_count = sum(
+            1
+            for entry in deduped
+            if entry.get("kind") == "message" and entry.get("source") == "当前消息"
+        )
+        for entry in deduped:
+            kind = str(entry.get("kind") or "")
+            if kind not in counters:
+                continue
+            counters[kind] += 1
+            ref_id = f"{kind}_{counters[kind]}"
+            item = {**entry, "id": ref_id}
+            if kind == "message" and item.get("source") == "当前消息":
+                message_position += 1
+                if current_message_count > 1:
+                    item["source"] = f"本轮第 {message_position} 条消息"
+            aliases = {ref_id}
+            for alias in (
+                item.get("forward_id"),
+                item.get("message_id"),
+                item.get("source_message_id"),
+            ):
+                alias = str(alias or "").strip()
+                if alias:
+                    aliases.add(alias)
+            item["aliases"] = aliases
+            registry[ref_id] = item
+
+        try:
+            event.set_extra(FORWARD_REGISTRY_EXTRA, registry)
+        except Exception:
+            pass
+        return registry
+
+    def _format_forward_catalog(self, registry: dict[str, dict]) -> str:
+        if not registry or not self.enable_wake_forwards or self.max_wake_forwards <= 0:
+            return ""
+        lines = [
+            "[可整理并发送为 QQ 合并聊天记录的来源]",
+            "只有确实需要发送时，才把下面的短引用传给 wake_qq_session_task 的 forward_refs，或在 forward_items 中引用。",
+            "forward_1 表示已有合并记录；message_1 表示一条零散消息，可把多个 message_* 组合成一条新的可展开记录。",
+        ]
+        catalog_items = list(registry.items())[: self.max_wake_forwards]
+        for ref_id, item in catalog_items:
+            if item.get("kind") == "forward":
+                kind_name = "已有合并聊天记录"
+            else:
+                kind_name = "可作为转发节点的零散消息"
+            sender_id = str(item.get("sender_id") or "").strip()
+            sender_name = str(item.get("sender_name") or sender_id).strip()
+            sender = (
+                f"{sender_name}({sender_id})"
+                if sender_id and sender_name != sender_id
+                else sender_name or "未知发送者"
+            )
+            lines.append(
+                f"- {ref_id}: {kind_name}，{item.get('source') or '当前消息'}，发送者 {sender}"
+            )
+        if len(registry) > len(catalog_items):
+            lines.append(
+                f"- 另有 {len(registry) - len(catalog_items)} 条来源未展示；"
+                "如需更多请提高 max_wake_forwards。"
+            )
+        return "\n".join(lines)
+
+    def _find_forward_entry(
+        self, registry: dict[str, dict], ref: str
+    ) -> dict | None:
+        direct = registry.get(ref)
+        if direct:
+            return direct
+        for item in registry.values():
+            if ref in item.get("aliases", set()):
+                return item
+        return None
+
+    def _normalize_forward_items(self, value) -> list[dict]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith(("[", "{")):
+                try:
+                    return self._normalize_forward_items(json.loads(text))
+                except Exception:
+                    pass
+            return [{"text": text}]
+        if isinstance(value, (list, tuple)):
+            items = []
+            for item in value:
+                items.extend(self._normalize_forward_items(item))
+            return items
+        return [{"text": str(value)}]
+
+    def _forward_item_attachment_refs(
+        self, forward_items: list[dict]
+    ) -> tuple[list[str], list[str]]:
+        image_refs = []
+        file_refs = []
+        for item in forward_items:
+            image_refs.extend(
+                self._normalize_attachment_refs(
+                    item.get("image_refs") or item.get("images")
+                )
+            )
+            file_refs.extend(
+                self._normalize_attachment_refs(
+                    item.get("file_refs") or item.get("files")
+                )
+            )
+        return list(dict.fromkeys(image_refs)), list(dict.fromkeys(file_refs))
+
+    def _unwrap_onebot_action_payload(self, payload):
+        if hasattr(payload, "data") and not isinstance(payload, dict):
+            try:
+                payload = payload.data
+            except Exception:
+                pass
+        if not isinstance(payload, dict):
+            return payload
+        data = payload.get("data")
+        if isinstance(data, dict) and not any(
+            key in payload for key in ("messages", "message", "nodes", "nodeList")
+        ):
+            return data
+        return payload
+
+    def _normalize_onebot_content(self, raw_content) -> list[dict]:
+        if isinstance(raw_content, list):
+            return [
+                copy.deepcopy(segment)
+                for segment in raw_content
+                if isinstance(segment, dict)
+            ]
+        if isinstance(raw_content, str):
+            text = raw_content.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return self._normalize_onebot_content(parsed)
+            return [{"type": "text", "data": {"text": text}}]
+        return []
+
+    def _sanitize_custom_forward_content(self, content: list[dict]) -> list[dict]:
+        sanitized = []
+        for segment in content:
+            seg_type = str(segment.get("type") or "").lower()
+            if seg_type in {"forward", "forward_msg", "node", "nodes"}:
+                sanitized.append(
+                    {
+                        "type": "text",
+                        "data": {"text": "[嵌套合并聊天记录]"},
+                    }
+                )
+                continue
+            sanitized.append(segment)
+        return sanitized
+
+    def _custom_node_from_raw_message(self, raw_node: dict) -> dict | None:
+        if str(raw_node.get("type") or "").lower() == "node":
+            data = raw_node.get("data")
+            if isinstance(data, dict):
+                content = self._sanitize_custom_forward_content(
+                    self._normalize_onebot_content(data.get("content") or [])
+                )
+                if content:
+                    sender_id = str(
+                        data.get("user_id") or data.get("uin") or "0"
+                    )
+                    sender_name = str(
+                        data.get("nickname")
+                        or data.get("name")
+                        or sender_id
+                        or "聊天记录"
+                    )
+                    node_data = {
+                        "user_id": sender_id,
+                        "uin": sender_id,
+                        "nickname": sender_name,
+                        "name": sender_name,
+                        "content": content,
+                    }
+                    node_time = self._normalize_forward_time(
+                        data.get("time") or data.get("timestamp")
+                    )
+                    if node_time:
+                        node_data["time"] = node_time
+                    return {"type": "node", "data": node_data}
+        sender = raw_node.get("sender")
+        if not isinstance(sender, dict):
+            sender = {}
+        sender_id = str(
+            sender.get("user_id")
+            or raw_node.get("user_id")
+            or raw_node.get("uin")
+            or "0"
+        )
+        sender_name = str(
+            sender.get("card")
+            or sender.get("nickname")
+            or raw_node.get("nickname")
+            or raw_node.get("name")
+            or sender_id
+            or "聊天记录"
+        )
+        content = self._sanitize_custom_forward_content(
+            self._normalize_onebot_content(
+                raw_node.get("message") or raw_node.get("content") or []
+            )
+        )
+        if not content:
+            raw_text = str(raw_node.get("raw_message") or "").strip()
+            if raw_text:
+                content = [{"type": "text", "data": {"text": raw_text}}]
+        if not content:
+            return None
+        node_data = {
+            "user_id": sender_id,
+            "uin": sender_id,
+            "nickname": sender_name,
+            "name": sender_name,
+            "content": content,
+        }
+        node_time = self._normalize_forward_time(
+            raw_node.get("time") or raw_node.get("timestamp")
+        )
+        if node_time:
+            node_data["time"] = node_time
+        return {"type": "node", "data": node_data}
+
+    def _extract_forward_raw_nodes(self, payload) -> list[dict]:
+        payload = self._unwrap_onebot_action_payload(payload)
+        if not isinstance(payload, dict):
+            return []
+        nodes = (
+            payload.get("messages")
+            or payload.get("message")
+            or payload.get("nodes")
+            or payload.get("nodeList")
+        )
+        return [node for node in nodes or [] if isinstance(node, dict)]
+
+    def _onebot_content_preview(self, content, limit: int = 120) -> str:
+        parts: list[tuple[str, bool]] = []
+        for segment in self._normalize_onebot_content(content):
+            seg_type = str(segment.get("type") or "").lower()
+            data = segment.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            if seg_type in {"text", "plain"}:
+                text = re.sub(r"\s+", " ", str(data.get("text") or "")).strip()
+                if text:
+                    parts.append((text, False))
+            elif seg_type == "image":
+                parts.append(("[图片]", True))
+            elif seg_type == "file":
+                parts.append(
+                    (
+                        f"[文件:{data.get('name') or data.get('file') or 'file'}]",
+                        True,
+                    )
+                )
+            elif seg_type in {"record", "voice"}:
+                parts.append(("[语音]", True))
+            elif seg_type == "video":
+                parts.append(("[视频]", True))
+            elif seg_type == "at":
+                parts.append(
+                    (f"@{data.get('name') or data.get('qq') or '成员'}", True)
+                )
+            elif seg_type in {"face", "mface"}:
+                parts.append(("[表情]", True))
+            elif seg_type == "reply":
+                parts.append(("[回复消息]", True))
+            elif seg_type in {"json", "xml"}:
+                parts.append(("[卡片消息]", True))
+            elif seg_type == "markdown":
+                text = re.sub(
+                    r"\s+",
+                    " ",
+                    str(data.get("content") or data.get("text") or ""),
+                ).strip()
+                parts.append((text or "[Markdown]", bool(not text)))
+            elif seg_type == "share":
+                title = str(data.get("title") or "链接").strip()
+                parts.append((f"[链接:{title}]", True))
+            elif seg_type == "contact":
+                parts.append(("[联系人]", True))
+            elif seg_type == "location":
+                title = str(data.get("title") or data.get("content") or "位置").strip()
+                parts.append((f"[位置:{title}]", True))
+            elif seg_type == "music":
+                parts.append(("[音乐]", True))
+            elif seg_type == "dice":
+                parts.append(("[骰子]", True))
+            elif seg_type == "rps":
+                parts.append(("[猜拳]", True))
+            elif seg_type == "poke":
+                parts.append(("[戳一戳]", True))
+            elif seg_type in {"forward", "forward_msg", "nodes"}:
+                parts.append(("[嵌套合并记录]", True))
+
+        preview = ""
+        previous_separated = False
+        for value, separated in parts:
+            if preview and (previous_separated or separated) and not preview.endswith(" "):
+                preview += " "
+            preview += value
+            previous_separated = separated
+        return preview if len(preview) <= limit else preview[:limit] + "…"
+
+    def _forward_card_nodes_for_metadata(
+        self,
+        primary_nodes: list[dict],
+        fallback_nodes: list[dict],
+    ) -> list[dict]:
+        # ID-only nodes have no sender/content fields. Prefer any reconstructed
+        # nodes available for stable card metadata, even if only part of the
+        # original record could be reconstructed.
+        return fallback_nodes or primary_nodes
+
+    def _forward_card_source(
+        self,
+        primary_nodes: list[dict],
+        fallback_nodes: list[dict],
+        *,
+        is_group_record: bool,
+    ) -> str:
+        if is_group_record:
+            return "群聊的聊天记录"
+
+        sender_names = []
+        for node in self._forward_card_nodes_for_metadata(
+            primary_nodes, fallback_nodes
+        ):
+            data = node.get("data") if isinstance(node, dict) else None
+            if not isinstance(data, dict):
+                continue
+            sender_name = str(
+                data.get("nickname") or data.get("name") or ""
+            ).strip()
+            if sender_name and sender_name not in sender_names:
+                sender_names.append(sender_name)
+            if len(sender_names) >= 4:
+                break
+        return (
+            "和".join(sender_names) + "的聊天记录"
+            if sender_names
+            else "聊天记录"
+        )
+
+    def _forward_card_news(
+        self,
+        primary_nodes: list[dict],
+        fallback_nodes: list[dict],
+        limit: int = 4,
+    ) -> list[dict]:
+        nodes = self._forward_card_nodes_for_metadata(
+            primary_nodes, fallback_nodes
+        )
+        news = []
+        for node in nodes:
+            data = node.get("data") if isinstance(node, dict) else None
+            if not isinstance(data, dict):
+                continue
+            content = data.get("content") or data.get("message") or []
+            preview = self._onebot_content_preview(content)
+            if not preview:
+                continue
+            sender_name = str(
+                data.get("nickname") or data.get("name") or "未知发送者"
+            ).strip()
+            news.append({"text": f"{sender_name}: {preview}"})
+            if len(news) >= limit:
+                break
+        return news
+
+    def _forward_preview(self, raw_nodes: list[dict], limit: int = 1200) -> str:
+        lines = []
+        for raw_node in raw_nodes:
+            sender = raw_node.get("sender")
+            if not isinstance(sender, dict):
+                sender = {}
+            sender_name = str(
+                sender.get("card")
+                or sender.get("nickname")
+                or raw_node.get("nickname")
+                or raw_node.get("name")
+                or "未知发送者"
+            )
+            preview = self._onebot_content_preview(
+                raw_node.get("message") or raw_node.get("content") or []
+            )
+            if preview:
+                lines.append(f"{sender_name}: {preview}")
+            if len("\n".join(lines)) >= limit:
+                break
+        preview = "\n".join(lines)
+        if len(preview) > limit:
+            preview = preview[:limit] + "\n[预览已截断]"
+        return preview
+
+    def _prepared_image_for_ref(self, prepared: dict, ref: str) -> dict | None:
+        for image in prepared.get("images", []):
+            if ref in {image.get("ref"), image.get("registry_id")}:
+                return image
+        return None
+
+    def _prepared_file_for_ref(self, prepared: dict, ref: str) -> dict | None:
+        for file_info in prepared.get("files", []):
+            if ref in {file_info.get("ref"), file_info.get("registry_id")}:
+                return file_info
+        return None
+
+    def _forward_sender_name_key(self, value) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip().lstrip("@"))
+        return text.casefold()
+
+    def _add_forward_sender_identity(
+        self,
+        directory: dict,
+        sender_id,
+        sender_name,
+        aliases=None,
+    ) -> None:
+        sender_id = str(sender_id or "").strip()
+        sender_name = str(sender_name or sender_id).strip()
+        if not sender_id:
+            return
+        identity = {"sender_id": sender_id, "sender_name": sender_name}
+        directory["by_id"].setdefault(sender_id, identity)
+        for alias in [sender_name, *(aliases or [])]:
+            key = self._forward_sender_name_key(alias)
+            if not key:
+                continue
+            existing = directory["by_name"].get(key, ...)
+            if existing is ...:
+                directory["by_name"][key] = identity
+            elif existing and existing.get("sender_id") != sender_id:
+                # Duplicate cards/nicknames cannot be mapped to a real QQ safely.
+                directory["by_name"][key] = None
+
+    def _source_group_id(self, event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        try:
+            group_id = str(event.get_group_id() or "").strip()
+            if group_id:
+                return group_id
+        except Exception:
+            pass
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if isinstance(raw, dict):
+            group_id = str(raw.get("group_id") or "").strip()
+            if group_id:
+                return group_id
+        origin = self._event_key(event)
+        marker = ":GroupMessage:"
+        if marker in origin:
+            return origin.rsplit(marker, 1)[-1].strip()
+        return ""
+
+    async def _build_forward_sender_directory(
+        self,
+        event: AstrMessageEvent,
+        registry: dict[str, dict],
+    ) -> dict:
+        directory = {"by_id": {}, "by_name": {}}
+        requester_id, requester_name = self._get_effective_requester(event)
+        self._add_forward_sender_identity(
+            directory, requester_id, requester_name
+        )
+        for entry in registry.values():
+            self._add_forward_sender_identity(
+                directory,
+                entry.get("sender_id"),
+                entry.get("sender_name"),
+            )
+
+        source_group_id = self._source_group_id(event)
+        source_platform = str(
+            getattr(event, "get_platform_id", lambda: "")() or ""
+        ).strip()
+        if not source_group_id or not source_platform:
+            return directory
+        try:
+            member_data = await self._call_source_platform_action(
+                event,
+                source_platform,
+                "get_group_member_list",
+                group_id=(
+                    int(source_group_id)
+                    if source_group_id.isdigit()
+                    else source_group_id
+                ),
+                no_cache=False,
+            )
+        except Exception as e:
+            logger.debug(f"读取来源群成员以还原合并记录发送者失败: {e}")
+            return directory
+        members = self._unwrap_list_data(member_data)
+        if not isinstance(members, list):
+            return directory
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            sender_id = member.get("user_id") or member.get("uin") or member.get("id")
+            card = str(member.get("card") or "").strip()
+            nickname = str(member.get("nickname") or member.get("name") or "").strip()
+            sender_name = card or nickname or sender_id
+            self._add_forward_sender_identity(
+                directory,
+                sender_id,
+                sender_name,
+                aliases=[card, nickname],
+            )
+        return directory
+
+    def _synthetic_forward_sender_id(
+        self,
+        sender_key: str,
+        directory: dict,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"gossip-sharer-forward:{sender_key}".encode()
+        ).digest()
+        value = 1_000_000_000 + int.from_bytes(digest[:8], "big") % 2_900_000_000
+        reserved = set(directory.get("by_id", {}))
+        while str(value) in reserved:
+            value = 1_000_000_000 + (value - 999_999_999) % 2_900_000_000
+        return str(value)
+
+    def _match_forward_sender_identity(
+        self,
+        directory: dict,
+        sender_name: str,
+    ) -> dict | None:
+        key = self._forward_sender_name_key(sender_name)
+        if not key:
+            return None
+        exact = directory.get("by_name", {}).get(key)
+        if exact:
+            return exact
+        if len(key) < 2:
+            return None
+        candidates = {}
+        for alias, identity in directory.get("by_name", {}).items():
+            if not identity or not alias:
+                continue
+            if key in alias or alias in key:
+                candidates[identity["sender_id"]] = identity
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return None
+
+    def _resolve_custom_forward_sender(
+        self,
+        item: dict,
+        directory: dict,
+        inherited_sender: dict | None,
+        item_index: int,
+    ) -> tuple[str, str]:
+        explicit_id = str(
+            item.get("sender_id")
+            or item.get("sender_qq")
+            or item.get("user_id")
+            or item.get("uin")
+            or ""
+        ).strip()
+        explicit_name = str(
+            item.get("sender_name")
+            or item.get("name")
+            or item.get("nickname")
+            or item.get("card")
+            or ""
+        ).strip()
+        inherited_id = str((inherited_sender or {}).get("sender_id") or "").strip()
+        inherited_name = str(
+            (inherited_sender or {}).get("sender_name") or inherited_id
+        ).strip()
+
+        if explicit_id:
+            known = directory.get("by_id", {}).get(explicit_id) or {}
+            return explicit_id, explicit_name or known.get("sender_name") or explicit_id
+        if inherited_id:
+            return inherited_id, explicit_name or inherited_name or inherited_id
+
+        lookup_name = explicit_name or inherited_name
+        if lookup_name:
+            matched = self._match_forward_sender_identity(
+                directory, lookup_name
+            )
+            if matched:
+                return matched["sender_id"], explicit_name or matched["sender_name"]
+
+        sender_name = lookup_name or f"聊天记录节点 {item_index}"
+        sender_key = lookup_name or f"item-{item_index}"
+        return self._synthetic_forward_sender_id(sender_key, directory), sender_name
+
+    def _build_custom_forward_item_node(
+        self,
+        event: AstrMessageEvent,
+        item: dict,
+        prepared: dict,
+        sender_directory: dict,
+        inherited_sender: dict | None = None,
+        item_index: int = 1,
+        default_time=None,
+    ) -> tuple[dict | None, list[str]]:
+        failures = []
+        content = []
+        at_names = self._normalize_at_names(item.get("at_names"))
+        for index, qq in enumerate(self._normalize_at_qqs(item.get("at_qqs"))):
+            content.append(
+                {
+                    "type": "at",
+                    "data": {"qq": str(qq), "name": at_names[index] if index < len(at_names) else qq},
+                }
+            )
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if text:
+            content.append({"type": "text", "data": {"text": text}})
+
+        for ref in self._normalize_attachment_refs(
+            item.get("image_refs") or item.get("images")
+        ):
+            image = self._prepared_image_for_ref(prepared, ref)
+            if not image:
+                failures.append(f"整理节点中的图片 {ref} 未准备成功")
+                continue
+            content.append(
+                {
+                    "type": "image",
+                    "data": {"file": f"base64://{image['base64']}"},
+                }
+            )
+
+        for ref in self._normalize_attachment_refs(
+            item.get("file_refs") or item.get("files")
+        ):
+            file_info = self._prepared_file_for_ref(prepared, ref)
+            if not file_info:
+                failures.append(f"整理节点中的文件 {ref} 未准备成功")
+                continue
+            content.append(
+                {
+                    "type": "file",
+                    "data": {
+                        "name": file_info["name"],
+                        "file": file_info["path"],
+                    },
+                }
+            )
+
+        if not content:
+            return None, failures or ["整理节点没有可发送内容"]
+
+        sender_id, sender_name = self._resolve_custom_forward_sender(
+            item,
+            sender_directory,
+            inherited_sender,
+            item_index,
+        )
+        node_time = self._normalize_forward_time(
+            item.get("time") or item.get("timestamp"), default_time
+        )
+        node_data = {
+            "user_id": sender_id,
+            "uin": sender_id,
+            "nickname": sender_name,
+            "name": sender_name,
+            "content": content,
+        }
+        if node_time:
+            node_data["time"] = node_time
+        node = {
+            "type": "node",
+            "data": node_data,
+        }
+        return node, failures
+
     def _ensure_attachment_registry(
         self,
         event: AstrMessageEvent | None,
@@ -624,13 +1709,17 @@ class GossipSharer(Star):
         event: AstrMessageEvent,
         image_refs,
         file_refs,
+        embedded_image_refs=None,
+        embedded_file_refs=None,
     ) -> dict:
         """Resolve selected images and files for delivery and target LLM context.
 
         Args:
             event: Source message event.
-            image_refs: Model-selected image references.
-            file_refs: Model-selected file references.
+            image_refs: Model-selected standalone image references.
+            file_refs: Model-selected standalone file references.
+            embedded_image_refs: Image references embedded inside custom forward nodes.
+            embedded_file_refs: File references embedded inside custom forward nodes.
 
         Returns:
             Prepared image payloads, file paths, cleanup paths, and failures.
@@ -644,7 +1733,11 @@ class GossipSharer(Star):
         total_bytes = 0
         total_limit = self.max_wake_total_mb * 1024 * 1024
 
-        normalized_images = self._normalize_attachment_refs(image_refs)
+        standalone_image_refs = self._normalize_attachment_refs(image_refs)
+        embedded_image_refs = self._normalize_attachment_refs(embedded_image_refs)
+        normalized_images = list(
+            dict.fromkeys([*standalone_image_refs, *embedded_image_refs])
+        )
         if normalized_images and not self.enable_wake_images:
             failures.append("图片发送功能已在配置中关闭")
             normalized_images = []
@@ -728,17 +1821,24 @@ class GossipSharer(Star):
                 images.append(
                     {
                         "ref": ref,
+                        "registry_id": entry.get("id") if entry else None,
                         "name": name,
                         "base64": encoded,
                         "llm_base64": llm_encoded,
                         "is_gif": is_gif,
                         "size": size,
+                        "standalone": ref in standalone_image_refs,
+                        "embedded": ref in embedded_image_refs,
                     }
                 )
             except Exception as e:
                 failures.append(f"图片 {ref}: {e}")
 
-        normalized_files = self._normalize_attachment_refs(file_refs)
+        standalone_file_refs = self._normalize_attachment_refs(file_refs)
+        embedded_file_refs = self._normalize_attachment_refs(embedded_file_refs)
+        normalized_files = list(
+            dict.fromkeys([*standalone_file_refs, *embedded_file_refs])
+        )
         if normalized_files and not self.enable_wake_files:
             failures.append("文件发送功能已在配置中关闭")
             normalized_files = []
@@ -792,10 +1892,13 @@ class GossipSharer(Star):
                 files.append(
                     {
                         "ref": ref,
+                        "registry_id": entry.get("id") if entry else None,
                         "name": name,
                         "path": str(snapshot_path),
                         "size": size,
                         "mime_type": mime_type,
+                        "standalone": ref in standalone_file_refs,
+                        "embedded": ref in embedded_file_refs,
                     }
                 )
                 cleanup_paths.append(snapshot_path)
@@ -820,6 +1923,468 @@ class GossipSharer(Star):
             "total_bytes": total_bytes,
         }
 
+    async def _component_chain_to_onebot_segments(self, components) -> list[dict]:
+        segments = []
+        for component in components or []:
+            if isinstance(component, Reply):
+                continue
+            if isinstance(component, Image):
+                try:
+                    encoded = await component.convert_to_base64()
+                    segments.append(
+                        {
+                            "type": "image",
+                            "data": {"file": f"base64://{encoded}"},
+                        }
+                    )
+                except Exception as e:
+                    logger.debug(f"合并记录节点图片转换失败，已跳过: {e}")
+                continue
+            if isinstance(component, Forward | Node | Nodes):
+                continue
+            try:
+                to_dict = getattr(component, "to_dict", None)
+                if callable(to_dict):
+                    segment = await to_dict()
+                else:
+                    segment = component.toDict()
+            except Exception as e:
+                logger.debug(f"合并记录节点组件转换失败，已跳过: {e}")
+                continue
+            if isinstance(segment, dict):
+                segments.append(segment)
+        return segments
+
+    async def _call_source_platform_action(
+        self,
+        event: AstrMessageEvent,
+        platform_id: str,
+        action: str,
+        **kwargs,
+    ):
+        current_platform_id = str(
+            getattr(event, "get_platform_id", lambda: "")() or ""
+        ).strip()
+        if platform_id and current_platform_id == platform_id:
+            bot = getattr(event, "bot", None)
+            for caller in (
+                getattr(bot, "call_action", None),
+                getattr(getattr(bot, "api", None), "call_action", None),
+            ):
+                if not callable(caller):
+                    continue
+                try:
+                    result = await caller(action, **kwargs)
+                    return self._unwrap_onebot_action_payload(result)
+                except Exception as e:
+                    logger.debug(f"通过来源事件调用 {action} 失败: {e}")
+        return self._unwrap_onebot_action_payload(
+            await self._call_platform_action(platform_id, action, **kwargs)
+        )
+
+    async def _forward_entry_nodes(
+        self,
+        event: AstrMessageEvent,
+        entry: dict,
+        target_platform: str,
+    ) -> tuple[list[dict], list[dict], str, list[str]]:
+        failures = []
+        source_platform = str(
+            entry.get("source_platform")
+            or getattr(event, "get_platform_id", lambda: "")()
+            or ""
+        ).strip()
+        raw_nodes = []
+
+        forward_id = str(entry.get("forward_id") or "").strip()
+        nodes_component = entry.get("nodes_component")
+        if forward_id:
+            payload = await self._call_source_platform_action(
+                event,
+                source_platform,
+                "get_forward_msg",
+                id=int(forward_id) if forward_id.isdigit() else forward_id,
+            )
+            raw_nodes = self._extract_forward_raw_nodes(payload)
+            if not raw_nodes:
+                return [], [], "", [
+                    f"{entry.get('id') or forward_id}: 获取合并聊天记录内容失败或记录已过期"
+                ]
+        elif nodes_component is not None:
+            try:
+                payload = await nodes_component.to_dict()
+                raw_nodes = self._extract_forward_raw_nodes(payload)
+            except Exception as e:
+                return [], [], "", [
+                    f"{entry.get('id') or '合并记录'}: 转换内联记录失败：{e}"
+                ]
+        elif entry.get("kind") == "message":
+            message_id = str(entry.get("message_id") or "").strip()
+            raw_segments = entry.get("raw_segments") or []
+            if entry.get("contains_forward"):
+                message_id = ""
+                raw_segments = [
+                    segment
+                    for segment in raw_segments
+                    if isinstance(segment, dict)
+                    and str(segment.get("type") or "").lower()
+                    not in {"forward", "forward_msg", "reply", "node", "nodes"}
+                ]
+            if not raw_segments and entry.get("component_chain"):
+                raw_segments = await self._component_chain_to_onebot_segments(
+                    entry.get("component_chain")
+                )
+            raw_node = {
+                "message_id": message_id,
+                "sender": {
+                    "user_id": entry.get("sender_id") or "0",
+                    "nickname": entry.get("sender_name")
+                    or entry.get("sender_id")
+                    or "聊天记录",
+                },
+                "message": raw_segments,
+                "time": entry.get("time"),
+            }
+            raw_nodes = [raw_node]
+
+        primary_nodes = []
+        fallback_nodes = []
+        for raw_node in raw_nodes:
+            custom_node = self._custom_node_from_raw_message(raw_node)
+            message_id = str(
+                raw_node.get("message_id")
+                or (
+                    raw_node.get("data", {}).get("id")
+                    if isinstance(raw_node.get("data"), dict)
+                    else ""
+                )
+                or ""
+            ).strip()
+            if source_platform == target_platform and message_id:
+                primary_nodes.append(
+                    {"type": "node", "data": {"id": message_id}}
+                )
+            elif custom_node:
+                primary_nodes.append(custom_node)
+            if custom_node:
+                fallback_nodes.append(custom_node)
+
+        if not primary_nodes:
+            failures.append(
+                f"{entry.get('id') or forward_id or '消息'}: 没有可构造的转发节点"
+            )
+        return primary_nodes, fallback_nodes, self._forward_preview(raw_nodes), failures
+
+    async def _prepare_wake_forwards(
+        self,
+        event: AstrMessageEvent,
+        target_platform: str,
+        forward_refs,
+        forward_items,
+        prepared_attachments: dict,
+    ) -> dict:
+        refs = self._normalize_attachment_refs(forward_refs)
+        items = self._normalize_forward_items(forward_items)
+        if not refs and not items:
+            return {"forwards": [], "failures": []}
+        if not self.enable_wake_forwards:
+            return {
+                "forwards": [],
+                "failures": ["合并聊天记录发送功能已在配置中关闭"],
+            }
+        if self.max_wake_forwards <= 0:
+            return {
+                "forwards": [],
+                "failures": ["合并聊天记录发送数量上限为 0"],
+            }
+        if len(refs) > self.max_wake_forwards:
+            refs = refs[: self.max_wake_forwards]
+            limit_failure = (
+                f"已有合并记录/消息引用超过上限 {self.max_wake_forwards}，"
+                f"仅处理前 {self.max_wake_forwards} 项"
+            )
+        else:
+            limit_failure = ""
+
+        registry = self._ensure_forward_registry(event)
+        primary_nodes = []
+        fallback_nodes = []
+        previews = []
+        failures = [limit_failure] if limit_failure else []
+        selected_refs = []
+        source_ref_count = 0
+        successful_source_count = 0
+        source_ref_limit_reported = False
+        source_is_group = bool(self._source_group_id(event))
+        force_group_source = False
+        has_constructed_nodes = False
+        base_forward_time = int(
+            self._normalize_forward_time(self._event_timestamp(event), time.time())
+        )
+
+        async def append_registry_ref(ref: str) -> dict | None:
+            nonlocal force_group_source, has_constructed_nodes
+            nonlocal source_ref_count, successful_source_count
+            nonlocal source_ref_limit_reported
+            if source_ref_count >= self.max_wake_forwards:
+                if not source_ref_limit_reported:
+                    failures.append(
+                        f"合并记录来源超过上限 {self.max_wake_forwards}，"
+                        "已忽略超出的来源"
+                    )
+                    source_ref_limit_reported = True
+                return None
+            entry = self._find_forward_entry(registry, ref)
+            if not entry:
+                failures.append(f"合并记录来源 {ref}: 当前消息中不存在此引用")
+                return None
+            source_ref_count += 1
+            if source_is_group and entry.get("kind") == "message":
+                force_group_source = True
+            if entry.get("kind") == "message":
+                has_constructed_nodes = True
+            nodes, fallback, preview, entry_failures = await self._forward_entry_nodes(
+                event, entry, target_platform
+            )
+            primary_nodes.extend(nodes)
+            fallback_nodes.extend(fallback)
+            failures.extend(entry_failures)
+            if preview:
+                previews.append(preview)
+            if nodes:
+                selected_refs.append(entry.get("id") or ref)
+                successful_source_count += 1
+            return entry
+
+        needs_sender_directory = any(
+            any(
+                item.get(key)
+                for key in (
+                    "text",
+                    "content",
+                    "image_refs",
+                    "images",
+                    "file_refs",
+                    "files",
+                    "at_qqs",
+                )
+            )
+            and not any(
+                item.get(key)
+                for key in ("sender_id", "sender_qq", "user_id", "uin")
+            )
+            for item in items
+        )
+        sender_directory = (
+            await self._build_forward_sender_directory(event, registry)
+            if needs_sender_directory
+            else {"by_id": {}, "by_name": {}}
+        )
+
+        for ref in refs:
+            await append_registry_ref(ref)
+
+        for item_index, item in enumerate(items, 1):
+            item_refs = self._normalize_attachment_refs(
+                item.get("ref")
+                or item.get("message_ref")
+                or item.get("forward_ref")
+                or item.get("refs")
+            )
+            inherited_sender = None
+            for ref in item_refs:
+                entry = await append_registry_ref(ref)
+                if inherited_sender is None and entry:
+                    inherited_sender = {
+                        "sender_id": entry.get("sender_id"),
+                        "sender_name": entry.get("sender_name"),
+                    }
+
+            sender_refs = self._normalize_attachment_refs(item.get("sender_ref"))
+            if sender_refs and inherited_sender is None:
+                sender_entry = self._find_forward_entry(registry, sender_refs[0])
+                if sender_entry:
+                    inherited_sender = {
+                        "sender_id": sender_entry.get("sender_id"),
+                        "sender_name": sender_entry.get("sender_name"),
+                    }
+                else:
+                    failures.append(
+                        f"发送者来源 {sender_refs[0]}: 当前消息中不存在此引用"
+                    )
+
+            has_custom_content = any(
+                item.get(key)
+                for key in (
+                    "text",
+                    "content",
+                    "image_refs",
+                    "images",
+                    "file_refs",
+                    "files",
+                    "at_qqs",
+                )
+            )
+            if has_custom_content:
+                has_constructed_nodes = True
+                if source_is_group:
+                    force_group_source = True
+                node, item_failures = self._build_custom_forward_item_node(
+                    event,
+                    item,
+                    prepared_attachments,
+                    sender_directory,
+                    inherited_sender=inherited_sender,
+                    item_index=item_index,
+                    default_time=(
+                        base_forward_time - max(len(items) - item_index, 0)
+                    ),
+                )
+                failures.extend(item_failures)
+                if node:
+                    primary_nodes.append(node)
+                    fallback_nodes.append(copy.deepcopy(node))
+                    selected_refs.append("自定义节点")
+
+        # A single existing forward card is kept as close to its native shape as
+        # possible. Combining multiple source cards creates a new record and
+        # therefore needs stable metadata just like message/custom-node records.
+        if successful_source_count > 1:
+            has_constructed_nodes = True
+            if source_is_group:
+                force_group_source = True
+
+        if len(primary_nodes) > self.max_forward_nodes:
+            failures.append(
+                f"合并记录共有 {len(primary_nodes)} 个节点，超过上限 "
+                f"{self.max_forward_nodes}，本次不发送合并记录"
+            )
+            primary_nodes = []
+            fallback_nodes = []
+
+        forwards = []
+        if primary_nodes:
+            source_title = ""
+            news = (
+                self._forward_card_news(primary_nodes, fallback_nodes)
+                if has_constructed_nodes
+                else []
+            )
+            summary = ""
+            prompt = ""
+            if has_constructed_nodes:
+                source_title = self._forward_card_source(
+                    primary_nodes,
+                    fallback_nodes,
+                    is_group_record=force_group_source,
+                )
+                summary = f"查看{len(primary_nodes)}条转发消息"
+                prompt = "[聊天记录]"
+            combined_previews = list(previews)
+            for item in news:
+                text = str(item.get("text") or "").strip()
+                if text and text not in combined_previews:
+                    combined_previews.append(text)
+            forwards.append(
+                {
+                    "nodes": primary_nodes,
+                    "fallback_nodes": fallback_nodes,
+                    "node_count": len(primary_nodes),
+                    "refs": selected_refs,
+                    "preview": "\n".join(combined_previews),
+                    "source": source_title,
+                    "news": news,
+                    "summary": summary,
+                    "prompt": prompt,
+                }
+            )
+        return {"forwards": forwards, "failures": failures}
+
+    def _onebot_action_succeeded(self, result) -> bool:
+        if result is False:
+            return False
+        if not isinstance(result, dict):
+            return result is not None
+        if result.get("status") in {"failed", "error"}:
+            return False
+        retcode = result.get("retcode")
+        if retcode not in (None, 0, "0"):
+            return False
+        return True
+
+    async def _send_wake_forwards(
+        self,
+        target_type: str,
+        target_id: str,
+        target_platform: str,
+        prepared: dict,
+    ) -> bool:
+        forwards = prepared.get("forwards", [])
+        if not forwards:
+            return True
+        platform = self._get_platform_by_id(target_platform)
+        bot = getattr(platform, "bot", None) if platform is not None else None
+        caller = getattr(bot, "call_action", None)
+        if not callable(caller):
+            caller = getattr(getattr(bot, "api", None), "call_action", None)
+        if not callable(caller):
+            return False
+
+        action = (
+            "send_group_forward_msg"
+            if target_type == "GroupMessage"
+            else "send_private_forward_msg"
+        )
+        target_key = "group_id" if target_type == "GroupMessage" else "user_id"
+        target_value = int(target_id) if str(target_id).isdigit() else target_id
+        for package in forwards:
+            def build_action_kwargs(nodes: list[dict]) -> dict:
+                kwargs = {target_key: target_value, "messages": nodes}
+                for key in ("source", "news", "summary", "prompt"):
+                    value = package.get(key)
+                    if value:
+                        kwargs[key] = value
+                return kwargs
+
+            try:
+                result = await caller(
+                    action,
+                    **build_action_kwargs(package["nodes"]),
+                )
+                if self._onebot_action_succeeded(result):
+                    continue
+                raise RuntimeError(f"平台返回失败结果: {result}")
+            except Exception as primary_error:
+                fallback_nodes = package.get("fallback_nodes") or []
+                if (
+                    not fallback_nodes
+                    or len(fallback_nodes) != len(package.get("nodes") or [])
+                    or fallback_nodes == package.get("nodes")
+                ):
+                    logger.warning(
+                        f"目标 QQ 合并记录投递失败: {primary_error}",
+                        exc_info=True,
+                    )
+                    return False
+                logger.info(
+                    "按原消息 ID 投递合并记录失败，改用已保存的自定义节点重试"
+                )
+                try:
+                    result = await caller(
+                        action,
+                        **build_action_kwargs(fallback_nodes),
+                    )
+                    if not self._onebot_action_succeeded(result):
+                        raise RuntimeError(f"平台返回失败结果: {result}")
+                except Exception as fallback_error:
+                    logger.warning(
+                        "目标 QQ 合并记录自定义节点降级投递失败: "
+                        f"{fallback_error}",
+                        exc_info=True,
+                    )
+                    return False
+        return True
+
     async def _send_wake_attachments(self, session_id: str, prepared: dict) -> bool:
         """Send selected attachments to the visible target QQ session.
 
@@ -833,12 +2398,31 @@ class GossipSharer(Star):
 
         chain = MessageChain()
         for image in prepared.get("images", []):
-            chain.base64_image(image["base64"])
+            if image.get("standalone", True):
+                chain.base64_image(image["base64"])
         for file_info in prepared.get("files", []):
-            chain.chain.append(File(name=file_info["name"], file=file_info["path"]))
+            if file_info.get("standalone", True):
+                chain.chain.append(
+                    File(name=file_info["name"], file=file_info["path"])
+                )
         if not chain.chain:
             return True
         return bool(await self.context.send_message(session_id, chain))
+
+    async def _send_wake_payloads(self, session_id: str, prepared: dict) -> bool:
+        """Send native merged records first, then standalone attachments."""
+
+        target_type = str(prepared.get("target_type") or "GroupMessage")
+        target_id = str(prepared.get("target_id") or "").strip()
+        target_platform = str(prepared.get("target_platform") or "").strip()
+        forwards_ok = await self._send_wake_forwards(
+            target_type,
+            target_id,
+            target_platform,
+            prepared,
+        )
+        attachments_ok = await self._send_wake_attachments(session_id, prepared)
+        return forwards_ok and attachments_ok
 
     def _format_wake_attachment_summary(
         self, prepared: dict, *, delivered: bool | None
@@ -857,29 +2441,43 @@ class GossipSharer(Star):
         lines = []
         images = prepared.get("images", [])
         files = prepared.get("files", [])
-        if images or files:
+        forwards = prepared.get("forwards", [])
+        if images or files or forwards:
             if delivered is None:
                 delivery_text = "将在本次回复发送完成后投递到目标会话"
             else:
                 delivery_text = (
                     "已发送到目标会话" if delivered else "未能发送到目标会话"
                 )
-            lines.append(f"附件投递状态: {delivery_text}")
+            lines.append(f"跨会话内容投递状态: {delivery_text}")
         if delivered is not False:
             for image in images:
-                recognition_note = (
-                    "，目标 LLM 使用首帧 PNG 识别" if image.get("is_gif") else ""
-                )
-                lines.append(
-                    f"- 图片: {image['name']} ({image['size'] / 1024 / 1024:.2f} MB{recognition_note})"
-                )
+                if image.get("standalone", True):
+                    recognition_note = (
+                        "，目标 LLM 使用首帧 PNG 识别" if image.get("is_gif") else ""
+                    )
+                    lines.append(
+                        f"- 图片: {image['name']} ({image['size'] / 1024 / 1024:.2f} MB{recognition_note})"
+                    )
+                elif image.get("embedded"):
+                    lines.append(f"- 合并记录内图片: {image['name']}")
             for file_info in files:
+                if file_info.get("standalone", True):
+                    lines.append(
+                        f"- 文件: {file_info['name']}，{file_info['mime_type']} "
+                        f"({file_info['size'] / 1024 / 1024:.2f} MB)"
+                    )
+                elif file_info.get("embedded"):
+                    lines.append(f"- 合并记录内文件: {file_info['name']}")
+            for forward in forwards:
+                preview = str(forward.get("preview") or "").strip()
                 lines.append(
-                    f"- 文件: {file_info['name']}，{file_info['mime_type']} "
-                    f"({file_info['size'] / 1024 / 1024:.2f} MB)"
+                    f"- 合并聊天记录: {forward.get('node_count', 0)} 个节点"
                 )
+                if preview:
+                    lines.append(f"  预览: {preview[:600]}")
         for failure in prepared.get("failures", []):
-            lines.append(f"- 附件失败: {failure}")
+            lines.append(f"- 内容准备失败: {failure}")
         return "\n".join(lines)
 
     def _effective_target_platform_id(
@@ -1451,10 +3049,11 @@ class GossipSharer(Star):
             "[主动社交提醒]\n"
             f"当前会话已经连续 {count} 次 LLM 请求没有发起跨会话行动。"
             "请回顾近期对话中是否出现了值得分享的趣事、吐槽、告状、请求转达、"
-            "邀请他人回应，或适合发送的图片和文件。"
+            "邀请他人回应，或适合发送的图片、文件和合并聊天记录。"
             "如果符合你的人设、关系和当下语境，可以主动调用 `wake_qq_session_task`，"
             "不必等待用户明确说出“转发”“告诉她”或“发过去”。"
             f"{target_hint}"
+            "如果要保留聊天记录形式，可选择提示中的 forward_1，或把多个 message_* 整理到 forward_refs；"
             "请在 task 中写清目标会话里的你应如何自然表达和处理；"
             "如果确实没有值得分享的内容，正常回复即可，不要提及这条内部提醒。"
         )
@@ -1465,7 +3064,9 @@ class GossipSharer(Star):
         source_session = str(task_payload.get("source_session") or "").strip()
         source_message = str(task_payload.get("source_message") or "").strip()
         task = str(task_payload.get("task") or "").strip()
-        attachment_summary = str(task_payload.get("attachment_summary") or "").strip()
+        attachment_summary = str(
+            task_payload.get("attachment_summary") or ""
+        ).strip()
 
         if self.max_source_message_chars <= 0:
             source_message = ""
@@ -1485,13 +3086,15 @@ class GossipSharer(Star):
             lines.extend(["原始消息:", source_message])
         if attachment_summary:
             lines.extend(["附件信息:", attachment_summary])
-        if task_payload.get("has_pending_attachments"):
+        if task_payload.get("has_pending_attachments") or task_payload.get(
+            "has_pending_forwards"
+        ):
             lines.extend(
                 [
-                    "附件执行规则:",
-                    "插件已经锁定并保存了本次选中的原始附件，会在本次行动完成时自动投递。",
-                    "不要调用 search_meme、send_message_to_user、图片搜索或其他发送工具来寻找、替换、补发这些附件。",
-                    "你只需完成文字、At、群管理等其余行动；如果任务明确要求纯附件且不要文字，可以保持最终回复为空。",
+                    "跨会话内容执行规则:",
+                    "插件已经锁定本次选中的图片、文件和合并聊天记录，会在你的文字回复发送完成后自动投递。",
+                    "合并聊天记录会以 QQ 原生可展开卡片发送；不要自行重组、搜索、替换、补发，也不要调用其他发送工具重复投递。",
+                    "你只需完成文字、At、群管理等其余行动；如果任务明确要求只发送选中的内容且不要文字，可以保持最终回复为空。",
                 ]
             )
         lines.extend(
@@ -1582,6 +3185,8 @@ class GossipSharer(Star):
         target_platform: str | None = None,
         image_refs=None,
         file_refs=None,
+        forward_refs=None,
+        forward_items=None,
     ) -> str:
         if not self.enable_target_session_tasks:
             return "唤醒失败：目标会话任务唤醒工具未启用。"
@@ -1639,7 +3244,29 @@ class GossipSharer(Star):
                 f"实际平台为 {platform_meta.name}。"
             )
 
-        prepared = await self._prepare_wake_attachments(event, image_refs, file_refs)
+        normalized_forward_items = self._normalize_forward_items(forward_items)
+        embedded_image_refs, embedded_file_refs = self._forward_item_attachment_refs(
+            normalized_forward_items
+        )
+        prepared = await self._prepare_wake_attachments(
+            event,
+            image_refs,
+            file_refs,
+            embedded_image_refs=embedded_image_refs,
+            embedded_file_refs=embedded_file_refs,
+        )
+        forward_prepared = await self._prepare_wake_forwards(
+            event,
+            platform_id,
+            forward_refs,
+            normalized_forward_items,
+            prepared,
+        )
+        prepared["forwards"] = forward_prepared.get("forwards", [])
+        prepared["failures"].extend(forward_prepared.get("failures", []))
+        prepared["target_type"] = target_type
+        prepared["target_id"] = target_id
+        prepared["target_platform"] = platform_id
         attachment_summary = self._format_wake_attachment_summary(
             prepared, delivered=None
         )
@@ -1656,6 +3283,7 @@ class GossipSharer(Star):
             "source_message": getattr(event, "get_message_str", lambda: "")(),
             "attachment_summary": attachment_summary,
             "has_pending_attachments": bool(prepared["images"] or prepared["files"]),
+            "has_pending_forwards": bool(prepared["forwards"]),
             "origin": "gossip_sharer",
         }
 
@@ -1686,7 +3314,8 @@ class GossipSharer(Star):
 
         logger.info(
             f"已投递目标 QQ 会话 LLM 唤醒事件: target={session_id}, "
-            f"requester={requester_id}, task={task}"
+            f"requester={requester_id}, task={task}, "
+            f"forward_nodes={sum(item.get('node_count', 0) for item in prepared['forwards'])}"
         )
         self._reset_no_share_count(event)
         result = f"{session_id} <- {task}"
@@ -1701,7 +3330,7 @@ class GossipSharer(Star):
         run_context,
         response: LLMResponse | None,
     ) -> None:
-        """Deliver pending attachments when the final agent reply is empty.
+        """Deliver pending attachments or merged records when the final reply is empty.
 
         Args:
             event: Synthetic target-session event.
@@ -1734,21 +3363,26 @@ class GossipSharer(Star):
             logger.warning("目标 QQ 会话最终回复为空，但缺少附件投递会话 ID")
             return
         try:
-            delivered = await self._send_wake_attachments(session_id, prepared)
-            if not delivered and (prepared.get("images") or prepared.get("files")):
-                logger.warning(f"目标平台未接受空回复兜底附件消息: {session_id}")
+            delivered = await self._send_wake_payloads(session_id, prepared)
+            has_pending = bool(
+                prepared.get("images")
+                or prepared.get("files")
+                or prepared.get("forwards")
+            )
+            if not delivered and has_pending:
+                logger.warning(f"目标平台未接受空回复兜底跨会话内容: {session_id}")
                 return
-            if prepared.get("images") or prepared.get("files"):
-                logger.info(f"目标会话空回复兜底附件已投递: target={session_id}")
+            if has_pending:
+                logger.info(f"目标会话空回复兜底内容已投递: target={session_id}")
         except Exception as e:
             logger.warning(
-                f"目标 QQ 会话空回复兜底附件投递失败: target={session_id}, error={e}",
+                f"目标 QQ 会话空回复兜底内容投递失败: target={session_id}, error={e}",
                 exc_info=True,
             )
 
     @filter.after_message_sent(priority=1000)
     async def send_pending_wake_attachments(self, event: AstrMessageEvent) -> None:
-        """Deliver delegated attachments after the target reply is sent.
+        """Deliver delegated attachments or merged records after the target reply.
 
         Args:
             event: Event that has completed AstrBot's response stage.
@@ -1772,15 +3406,20 @@ class GossipSharer(Star):
             return
 
         try:
-            delivered = await self._send_wake_attachments(session_id, prepared)
-            if not delivered and (prepared.get("images") or prepared.get("files")):
-                logger.warning(f"目标平台未接受回复后的附件消息: {session_id}")
+            delivered = await self._send_wake_payloads(session_id, prepared)
+            has_pending = bool(
+                prepared.get("images")
+                or prepared.get("files")
+                or prepared.get("forwards")
+            )
+            if not delivered and has_pending:
+                logger.warning(f"目标平台未接受回复后的跨会话内容: {session_id}")
                 return
-            if prepared.get("images") or prepared.get("files"):
-                logger.info(f"目标会话回复后附件已投递: target={session_id}")
+            if has_pending:
+                logger.info(f"目标会话回复后内容已投递: target={session_id}")
         except Exception as e:
             logger.warning(
-                f"目标 QQ 会话回复后附件投递失败: target={session_id}, error={e}",
+                f"目标 QQ 会话回复后内容投递失败: target={session_id}, error={e}",
                 exc_info=True,
             )
 
@@ -1938,17 +3577,20 @@ class GossipSharer(Star):
         target_platform: str = None,
         image_refs: list[str] = None,
         file_refs: list[str] = None,
+        forward_refs: list[str] = None,
+        forward_items: list[dict] = None,
     ):
         """
         将任务委派给指定 QQ 群聊或私聊的目标 LLM。
 
         这是 Bot 的主动跨会话社交能力，不只是被动转发工具。当当前会话出现值得告诉
-        其他人的趣事、吐槽、告状、请求转达、邀请回应或适合分享的图片和文件时，
+        其他人的趣事、吐槽、告状、请求转达、邀请回应或适合分享的图片、文件和合并聊天记录时，
         可以结合人设、关系和目标会话语境自主调用，不必等待用户明确要求“转发”。
         目标 LLM 会读取目标会话上下文，并自行说话、查询成员、At 或调用工具。
-        task 必须写清楚目标会话要完成的事情。只有确实要把附件发过去时，
-        才传入当前提示中列出的 image_refs 或 file_refs；未选择的附件不会自动发送。
-        选中的附件会在目标 LLM 回复发送完成后投递，图片仍会先提供给目标 LLM 识别。
+        task 必须写清楚目标会话要完成的事情。只有确实要把内容发过去时，
+        才传入当前提示中列出的 image_refs、file_refs、forward_refs 或 forward_items；
+        未选择的内容不会自动发送。选中的图片、文件和合并聊天记录会在目标 LLM
+        回复发送完成后投递，图片仍会先提供给目标 LLM 识别。
 
         Args:
             target_id (str): 目标 QQ 群号或好友 QQ。群目标必须在白名单中；私聊目标遵循私聊安全配置。
@@ -1957,6 +3599,8 @@ class GossipSharer(Star):
             target_platform (str): 可选。QQ 平台 ID。默认使用 default_platform；未配置时尝试使用当前 QQ 平台。
             image_refs (list[string]): 可选。要主动发送的图片引用。当前消息或引用图片必须优先使用 image_1 这类短引用，不要复用历史中的 media_image 临时路径；也支持仍然有效的允许路径、URL 或 base64。
             file_refs (list[string]): 可选。要主动发送的文件短引用、允许路径或 HTTP/HTTPS URL。
+            forward_refs (list[string]): 可选。要发送为原生 QQ 合并聊天记录的来源引用。使用提示中列出的 forward_1（已有合并记录）或 message_1、message_2（零散消息）；多个引用会按顺序整理成一张可展开卡片。
+            forward_items (list[dict]): 可选。用于整理新的合并聊天记录。每项可包含 ref/message_ref/forward_ref（插入已有来源并自动保留原发送者）、sender_ref（只继承某条来源的真实发送者）、text、image_refs、file_refs、at_qqs、at_names、sender_name、sender_id、time。自定义节点必须尽量填写真实 sender_name，已知 QQ 时同时填写 sender_id；仅有名称时插件会优先匹配来源群成员，匹配不到也会生成独立显示身份。有图片的节点必须把提示中的 image_1 等短引用放入该节点的 image_refs，不要只在 text 中写“[图片]”；仅放在顶层 image_refs 会变成卡片外单独发送。at_names 可与 at_qqs 按顺序对应，用于稳定显示历史 At 名称。time 可传 Unix 秒或毫秒时间戳，不传时插件会按节点顺序生成连续时间。例如 [{"sender_name":"甲","text":"第一条"},{"sender_name":"乙","text":"看图","image_refs":["image_1"]}]。只有确实需要自定义节点时才使用，不要把内部说明写进 text。
         """
         try:
             result = await self._safe_wake_qq_session_task(
@@ -1967,6 +3611,8 @@ class GossipSharer(Star):
                 target_platform=target_platform,
                 image_refs=image_refs,
                 file_refs=file_refs,
+                forward_refs=forward_refs,
+                forward_items=forward_items,
             )
             if result.startswith("唤醒失败："):
                 return result
@@ -1974,12 +3620,27 @@ class GossipSharer(Star):
         except Exception as e:
             return f"唤醒失败：{str(e)}"
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=60)
+    async def capture_forward_sources(self, event: AstrMessageEvent):
+        """Capture QQ message IDs before debounce/reconstruction plugins rewrite them."""
+
+        if not self.enable_wake_forwards:
+            return
+        try:
+            if self._is_synthetic_event(event):
+                return
+        except Exception:
+            pass
+        entries = self._build_capture_entries(event)
+        self._store_captured_forward_sources(event, entries)
+
     @filter.on_llm_request()
     async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
         if self._is_synthetic_event(event):
             return
 
         registry = self._ensure_attachment_registry(event, req.image_urls)
+        forward_registry = self._ensure_forward_registry(event)
         snapshotted = 0
         for item in registry.values():
             if item.get("kind") != "image" or item.get("snapshot_base64"):
@@ -2036,6 +3697,11 @@ class GossipSharer(Star):
         if attachment_catalog:
             req.extra_user_content_parts.append(
                 TextPart(text=attachment_catalog).mark_as_temp()
+            )
+        forward_catalog = self._format_forward_catalog(forward_registry)
+        if forward_catalog:
+            req.extra_user_content_parts.append(
+                TextPart(text=forward_catalog).mark_as_temp()
             )
 
         if self.guarantee_threshold <= 0:

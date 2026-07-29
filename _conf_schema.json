@@ -46,6 +46,13 @@
         "description": "允许 wake 携带文件",
         "hint": "开启后，Bot 可在 wake_qq_session_task 的 file_refs 中主动选择文件。文件会生成一次性临时快照，在目标回复发送完成后投递；目标 LLM 会提前获得文件名、类型、大小和待投递状态。"
     },
+    "enable_wake_forwards": {
+        "type": "bool",
+        "default": true,
+        "description": "允许 wake 携带合并聊天记录",
+        "hint": "开启后，Bot 可在 wake_qq_session_task 的 forward_refs 或 forward_items 中选择、整理 QQ 原生合并聊天记录。目标 LLM 回复完成后才投递可展开卡片；关闭后相关参数会被拒绝。",
+        "obvious_hint": true
+    },
     "allow_remote_attachment_urls": {
         "type": "bool",
         "default": true,
@@ -64,6 +71,18 @@
         "default": 3,
         "description": "单次文件数量上限",
         "hint": "一次 wake 最多处理多少个主动选择的文件。设为 0 时禁止携带文件。"
+    },
+    "max_wake_forwards": {
+        "type": "int",
+        "default": 10,
+        "description": "合并记录来源上限",
+        "hint": "一次 wake 最多处理多少个已有合并记录或消息引用来源。多个来源会按顺序合并为一张 QQ 可展开卡片；设为 0 时禁止携带合并记录。"
+    },
+    "max_forward_nodes": {
+        "type": "int",
+        "default": 50,
+        "description": "合并记录节点上限",
+        "hint": "一张合并聊天记录最多包含多少个节点。超过上限时不会发送该合并记录，文字任务仍会继续。"
     },
     "max_wake_image_mb": {
         "type": "int",
