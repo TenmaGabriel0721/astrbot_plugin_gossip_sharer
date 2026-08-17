@@ -34,24 +34,6 @@
         "hint": "控制 wake_qq_session_task。开启后，可把任务投递到目标 QQ 群聊或私聊的 LLM 会话；关闭后该工具会拒绝所有唤醒请求。",
         "obvious_hint": true
     },
-    "wake_route_cooldown_seconds": {
-        "type": "int",
-        "default": 60,
-        "description": "同一路由冷却（秒）",
-        "hint": "同一个来源会话再次联系同一个目标会话前至少等待多少秒。只统计成功投递，被限流的重试不会延长冷却；设为 0 时关闭这一层限制。"
-    },
-    "wake_target_window_seconds": {
-        "type": "int",
-        "default": 1800,
-        "description": "目标限流窗口（秒）",
-        "hint": "统计同一目标会话接收 wake 次数的滑动时间窗口，默认 1800 秒即 30 分钟。它会合并来自不同来源会话的投递；设为 0 时关闭目标窗口限制。"
-    },
-    "wake_target_max_in_window": {
-        "type": "int",
-        "default": 3,
-        "description": "窗口内目标上限",
-        "hint": "同一目标会话在滑动窗口内最多成功接收多少次 wake。一次 wake 即使随后发送文字、图片、文件和合并记录也只计一次；设为 0 时关闭目标窗口限制。"
-    },
     "enable_wake_images": {
         "type": "bool",
         "default": true,
@@ -94,7 +76,7 @@
         "type": "int",
         "default": 10,
         "description": "合并记录来源上限",
-        "hint": "来源目录只保留最近这些已有合并记录或消息引用，一次 wake 也最多处理相同数量。多个来源会按顺序合并为一张 QQ 可展开卡片；设为 0 时禁止携带合并记录。"
+        "hint": "一次 wake 最多处理多少个已有合并记录或消息引用来源。多个来源会按顺序合并为一张 QQ 可展开卡片；设为 0 时禁止携带合并记录。"
     },
     "max_forward_nodes": {
         "type": "int",
@@ -140,7 +122,7 @@
         "type": "int",
         "default": 10,
         "description": "未分享提醒阈值",
-        "hint": "每个来源会话连续多少次 LLM 请求未成功执行跨会话行动后，进行一次严格、低频的自主联系复盘。提醒不是调用指标，不鼓励分享普通闲聊或重复话题；拿不准时应保持不发送。达到阈值后会立即重新计数并进入下一周期；小于或等于 0 时关闭。"
+        "hint": "每个来源会话连续多少次 LLM 请求未成功执行跨会话行动后，提醒 Bot 主动回顾是否有值得分享、转述或邀请回应的内容。达到阈值后会立即重新计数并进入下一周期；小于或等于 0 时关闭。"
     },
     "guarantee_injection_method": {
         "type": "string",
