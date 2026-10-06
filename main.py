@@ -54,6 +54,14 @@ FORWARD_CAPTURE_MAX_MESSAGES = 30
 # 实测上游 LLM 会在一次 tool-loop 内相隔约 12-14s 重复调用，30s 留足余量。
 WAKE_DEDUP_WINDOW_SECONDS = 30
 
+# 适配器分组：OneBot 与 QQ 官方机器人各自只在本组平台内唤醒，互不跨投。
+ONEBOT_ADAPTERS = {"aiocqhttp"}
+OFFICIAL_ADAPTERS = {"qq_official", "qq_official_webhook"}
+
+# QQ 官方被动回复 msg_id 的有效期：群聊 5 分钟，单聊 60 分钟；过期后走主动推送。
+OFFICIAL_REPLY_WINDOW_SECONDS = {"GroupMessage": 300, "FriendMessage": 3600}
+OFFICIAL_SEEN_MEMBERS_LIMIT = 200
+
 
 @register(
     "astrbot_plugin_gossip_sharer", "gabriel", "全能消息转发与告状工具", PLUGIN_VERSION
@@ -103,6 +111,16 @@ class GossipSharer(Star):
         )
         self.group_whitelist = []
         self._load_group_whitelist()
+        self.official_sister_openid = str(
+            self.config.get("official_sister_openid", "")
+        ).strip()
+        self.official_group_whitelist = list(
+            dict.fromkeys(
+                self._normalize_string_list(
+                    self.config.get("official_group_whitelist", [])
+                )
+            )
+        )
         self.guarantee_threshold = int(self.config.get("guarantee_threshold", 10))
         self.guarantee_injection_method = str(
             self.config.get("guarantee_injection_method", "extra_user_content")
@@ -123,19 +141,15 @@ class GossipSharer(Star):
         self._wake_signature_lock = asyncio.Lock()
         self._inflight_wake_signatures: set[str] = set()
         self._recent_wake_signatures: dict[str, float] = {}
-
-        if not self.default_platform:
-            logger.warning(
-                "转发告状工具未配置 default_platform，发送时需要显式传入 target_platform"
-            )
-        if not self.sister_qq:
-            logger.warning(
-                "转发告状工具未配置 sister_qq，默认私聊目标与保底提示将不可用"
-            )
+        # QQ 官方接口拿不到群/好友列表，按会话记录运行期间见过的群、私聊和发言成员。
+        self._official_sessions: dict[str, dict] = {}
 
         logger.info(
-            f"转发告状工具 v{PLUGIN_VERSION} 已加载。姐姐: {self.sister_qq or '未配置'}，"
-            f"默认平台: {self.default_platform or '未配置'}，白名单群数量: {len(self.group_whitelist)}，"
+            f"转发告状工具 v{PLUGIN_VERSION} 已加载。"
+            f"OneBot 姐姐/白名单群: {self.sister_qq or '未配置'}/{len(self.group_whitelist)}，"
+            f"QQ 官方姐姐/白名单群: {self.official_sister_openid or '未配置'}/"
+            f"{len(self.official_group_whitelist)}，"
+            f"默认平台: {self.default_platform or '跟随来源事件'}，"
             f"保底阈值/注入位置: {self.guarantee_threshold}/{self.guarantee_injection_method}，"
             f"任意私聊目标: {self.enable_arbitrary_friend_targets}，"
             f"目标会话任务唤醒: {self.enable_target_session_tasks}，"
@@ -145,6 +159,7 @@ class GossipSharer(Star):
 
     async def terminate(self):
         self._captured_forward_sources.clear()
+        self._official_sessions.clear()
 
     def _soft_whitelist_config_path(self) -> str:
         return os.path.abspath(
@@ -267,35 +282,104 @@ class GossipSharer(Star):
     def _reset_no_share_count(self, event: AstrMessageEvent | None) -> None:
         self.no_share_counts.pop(self._event_key(event), None)
 
-    def _build_session_id(
-        self, target_type: str, target_id: str, target_platform: str = None
-    ) -> str | None:
-        platform = str(target_platform or self.default_platform).strip()
-        if not platform:
-            return None
-        return f"{platform}:{target_type}:{str(target_id)}"
+    @staticmethod
+    def _build_session_id(target_type: str, target_id: str, platform_id: str) -> str:
+        return f"{platform_id}:{target_type}:{target_id}"
+
+    @staticmethod
+    def _adapter_kind(adapter_name: str) -> str:
+        if adapter_name in ONEBOT_ADAPTERS:
+            return "onebot"
+        if adapter_name in OFFICIAL_ADAPTERS:
+            return "official"
+        return ""
+
+    def _platform_kind(self, platform) -> str:
+        try:
+            return self._adapter_kind(platform.meta().name)
+        except Exception:
+            return ""
+
+    def _event_kind(self, event: AstrMessageEvent | None) -> str:
+        if event is None:
+            return ""
+        try:
+            return self._adapter_kind(event.get_platform_name())
+        except Exception:
+            return ""
+
+    def _resolve_target_platform(
+        self, event: AstrMessageEvent, target_platform: str | None = None
+    ) -> tuple[object | None, str, str]:
+        """Pick the target platform inside the source adapter's own scope.
+
+        OneBot 与 QQ 官方机器人的会话 ID 互不相通，目标平台必须与来源事件属于
+        同一类适配器。优先级：显式 target_platform > 同类的 default_platform >
+        来源事件所在平台。
+
+        Returns:
+            ``(platform, kind, error)``，error 非空时前两项无意义。
+        """
+
+        kind = self._event_kind(event)
+        if not kind:
+            return (
+                None,
+                "",
+                "当前来源平台不受支持，仅支持 QQ OneBot(aiocqhttp) 与 QQ 官方机器人。",
+            )
+
+        platform_id = str(target_platform or "").strip()
+        if not platform_id and self.default_platform:
+            default = self._get_platform_by_id(self.default_platform)
+            if default is not None and self._platform_kind(default) == kind:
+                platform_id = self.default_platform
+        platform_id = platform_id or str(event.get_platform_id() or "").strip()
+
+        platform = self._get_platform_by_id(platform_id)
+        if platform is None:
+            return None, "", f"未找到目标平台 {platform_id}。"
+        if self._platform_kind(platform) != kind:
+            return (
+                None,
+                "",
+                f"目标平台 {platform_id} 与来源平台不是同一类 QQ 适配器，"
+                "OneBot 与 QQ 官方机器人之间不互相投递。",
+            )
+        return platform, kind, ""
+
+    def _target_policy(self, kind: str) -> tuple[list[str], str, str]:
+        """Return group whitelist, default private target and its config key."""
+
+        if kind == "official":
+            return (
+                self.official_group_whitelist,
+                self.official_sister_openid,
+                "official_sister_openid",
+            )
+        self._load_group_whitelist()
+        return self.group_whitelist, self.sister_qq, "sister_qq"
 
     def _validate_target(
-        self, target_type: str, target_id: str, target_platform: str = None
+        self, target_type: str, target_id: str, kind: str
     ) -> str | None:
-        self._load_group_whitelist()
         if target_type not in ("FriendMessage", "GroupMessage"):
             return "发送失败：target_type 只允许为 FriendMessage 或 GroupMessage。"
         if not str(target_id).strip():
             return "发送失败：target_id 不能为空。"
-        if not str(target_platform or self.default_platform).strip():
-            return "发送失败：未配置默认平台 ID，请先配置 default_platform 或传入 target_platform。"
-        if target_type == "GroupMessage" and str(target_id) not in self.group_whitelist:
+        group_whitelist, sister_id, sister_key = self._target_policy(kind)
+        if target_type == "GroupMessage" and str(target_id) not in group_whitelist:
             return f"发送失败：群 {target_id} 不在白名单里。"
         if target_type == "FriendMessage":
-            if not self.sister_qq:
-                return "发送失败：未配置 sister_qq，无法校验默认私聊目标。"
+            if not sister_id:
+                return f"发送失败：未配置 {sister_key}，无法校验默认私聊目标。"
             if (
                 not self.enable_arbitrary_friend_targets
-                and str(target_id) != self.sister_qq
+                and str(target_id) != sister_id
             ):
                 return (
-                    "发送失败：当前未开启任意私聊目标，仅允许发送给配置的 sister_qq。"
+                    "发送失败：当前未开启任意私聊目标，"
+                    f"仅允许发送给配置的 {sister_key}。"
                 )
         return None
 
@@ -418,14 +502,6 @@ class GossipSharer(Star):
         }
         return mapping.get(text.lower(), text)
 
-    def _is_qq_source_event(self, event: AstrMessageEvent | None) -> bool:
-        if event is None:
-            return False
-        try:
-            return event.get_platform_name() == "aiocqhttp"
-        except Exception:
-            return False
-
     def _event_message_id(self, event: AstrMessageEvent | None) -> str:
         if event is None:
             return ""
@@ -508,7 +584,7 @@ class GossipSharer(Star):
     def _build_capture_entries(self, event: AstrMessageEvent) -> list[dict]:
         """Capture source message IDs before debounce plugins rebuild the event."""
 
-        if not self._is_qq_source_event(event):
+        if self._event_kind(event) != "onebot":
             return []
         try:
             if event.get_extra(SYNTHETIC_EVENT_EXTRA, False):
@@ -2088,10 +2164,13 @@ class GossipSharer(Star):
                     return False
         return True
 
-    async def _send_wake_attachments(self, session_id: str, prepared: dict) -> bool:
+    async def _send_wake_attachments(
+        self, event: AstrMessageEvent, session_id: str, prepared: dict
+    ) -> bool:
         """Send selected attachments to the visible target QQ session.
 
         Args:
+            event: Synthetic target-session event.
             session_id: Unified target session ID.
             prepared: Result returned by ``_prepare_wake_attachments``.
 
@@ -2110,9 +2189,16 @@ class GossipSharer(Star):
                 )
         if not chain.chain:
             return True
+        if self._event_kind(event) == "official":
+            # 官方适配器的 send_by_session 依赖它自己缓存的 msg_id，重启后没见过的群会被跳过；
+            # 走合成事件自身的回复链路，可复用被动回复并在失败时自动降级为主动推送。
+            await event.send(chain)
+            return True
         return bool(await self.context.send_message(session_id, chain))
 
-    async def _send_wake_payloads(self, session_id: str, prepared: dict) -> bool:
+    async def _send_wake_payloads(
+        self, event: AstrMessageEvent, session_id: str, prepared: dict
+    ) -> bool:
         """Send native merged records first, then standalone attachments."""
 
         target_type = str(prepared.get("target_type") or "GroupMessage")
@@ -2124,7 +2210,9 @@ class GossipSharer(Star):
             target_platform,
             prepared,
         )
-        attachments_ok = await self._send_wake_attachments(session_id, prepared)
+        attachments_ok = await self._send_wake_attachments(
+            event, session_id, prepared
+        )
         return forwards_ok and attachments_ok
 
     def _format_wake_attachment_summary(
@@ -2218,22 +2306,6 @@ class GossipSharer(Star):
         async with self._wake_signature_lock:
             self._inflight_wake_signatures.discard(signature)
             self._recent_wake_signatures[signature] = time.time()
-
-    def _effective_target_platform_id(
-        self,
-        event: AstrMessageEvent | None = None,
-        target_platform: str | None = None,
-    ) -> str:
-        platform_id = str(target_platform or self.default_platform or "").strip()
-        if platform_id or event is None:
-            return platform_id
-
-        try:
-            if event.get_platform_name() == "aiocqhttp":
-                return str(event.get_platform_id() or "").strip()
-        except Exception:
-            pass
-        return ""
 
     def _format_at_note(
         self, at_qqs: list[str] | None = None, at_all: bool = False
@@ -2429,7 +2501,10 @@ class GossipSharer(Star):
         at_name_list = self._normalize_at_names(at_names)
         at_all_enabled = self._normalize_bool(at_all)
 
-        error = self._validate_target(target_type, target_id, target_platform)
+        platform, kind, error = self._resolve_target_platform(event, target_platform)
+        if error:
+            return f"发送失败：{error}"
+        error = self._validate_target(target_type, target_id, kind)
         if error:
             return error
         if (at_qq_list or at_all_enabled) and target_type != "GroupMessage":
@@ -2444,9 +2519,9 @@ class GossipSharer(Star):
         ):
             return "发送失败：content、image_url、image_path、image_base64、at_qqs、at_all 不能全部为空。"
 
-        session_id = self._build_session_id(target_type, target_id, target_platform)
-        if not session_id:
-            return "发送失败：未配置默认平台 ID，请先配置 default_platform 或传入 target_platform。"
+        session_id = self._build_session_id(
+            target_type, target_id, platform.meta().id
+        )
 
         try:
             chain = self._build_message_chain(
@@ -2598,14 +2673,7 @@ class GossipSharer(Star):
                 logger.debug(f"调用平台动作 {action} 失败: {e}")
         return None
 
-    async def _try_get_target_group_members(
-        self,
-        target_id: str,
-        target_platform: str | None = None,
-    ):
-        platform_id = str(target_platform or self.default_platform).strip()
-        if not platform_id:
-            return None
+    async def _try_get_target_group_members(self, target_id: str, platform_id: str):
         return await self._call_platform_action(
             platform_id,
             "get_group_member_list",
@@ -2774,12 +2842,158 @@ class GossipSharer(Star):
 
         return "目标群成员列表：\n" + "\n".join(lines) + extra
 
-    def _build_guarantee_prompt(self, count: int) -> str:
+    def _official_session(
+        self, platform_id: str, target_type: str, target_id: str
+    ) -> dict:
+        session_id = self._build_session_id(target_type, target_id, platform_id)
+        return self._official_sessions.setdefault(
+            session_id,
+            {
+                "platform": platform_id,
+                "type": target_type,
+                "id": target_id,
+                "name": "",
+                "name_checked": False,
+                "last_active": 0.0,
+                "last_message_id": "",
+                "members": {},
+            },
+        )
+
+    async def _ensure_official_group_name(self, client, record: dict) -> None:
+        """Fill a group name via ``GET /v2/groups/{group_openid}/info`` once per run."""
+
+        from botpy.http import Route
+
+        if record["name"] or record["name_checked"]:
+            return
+        record["name_checked"] = True
+        try:
+            payload = await client.api._http.request(
+                Route(
+                    "GET",
+                    "/v2/groups/{group_openid}/info",
+                    group_openid=record["id"],
+                )
+            )
+        except Exception as e:
+            logger.debug(f"获取 QQ 官方群 {record['id']} 信息失败: {e}")
+            return
+        if isinstance(payload, dict):
+            record["name"] = str(payload.get("group_name") or "")
+
+    @staticmethod
+    def _format_elapsed(timestamp: float) -> str:
+        if not timestamp:
+            return "本次运行未收到消息"
+        seconds = int(time.time() - timestamp)
+        if seconds < 60:
+            return "刚刚活跃"
+        if seconds < 3600:
+            return f"{seconds // 60} 分钟前活跃"
+        return f"{seconds // 3600} 小时前活跃"
+
+    async def _format_official_groups(self, event: AstrMessageEvent) -> str:
+        platform_id = event.get_platform_id()
+        whitelist = set(self.official_group_whitelist)
+        for group_id in self.official_group_whitelist:
+            self._official_session(platform_id, "GroupMessage", group_id)
+        records = [
+            record
+            for record in self._official_sessions.values()
+            if record["platform"] == platform_id and record["type"] == "GroupMessage"
+        ]
+        if not records:
+            return "QQ 官方机器人当前没有白名单群，本次运行也还没收到过群消息。"
+
+        lines = [
+            "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为白名单群和本次运行中收到过消息的群；"
+            "target_id 填 group_openid。超过 5 分钟没有新消息的群只能主动推送，可能受平台限制）："
+        ]
+        records.sort(key=lambda item: item["last_active"], reverse=True)
+        for record in records[:50]:
+            await self._ensure_official_group_name(event.bot, record)
+            status = " [白名单可转发]" if record["id"] in whitelist else ""
+            lines.append(
+                f"- {record['name'] or '未知群名'} ({record['id']}){status}，"
+                f"{self._format_elapsed(record['last_active'])}"
+            )
+        return "\n".join(lines)
+
+    def _format_official_friends(self, event: AstrMessageEvent) -> str:
+        platform_id = event.get_platform_id()
+        if self.official_sister_openid:
+            self._official_session(
+                platform_id, "FriendMessage", self.official_sister_openid
+            )
+        records = [
+            record
+            for record in self._official_sessions.values()
+            if record["platform"] == platform_id and record["type"] == "FriendMessage"
+        ]
+        if not records:
+            return "QQ 官方机器人未配置 official_sister_openid，本次运行也还没收到过私聊消息。"
+
+        lines = [
+            "QQ 官方机器人可感知到的私聊对象（官方接口不提供好友列表，以下为默认私聊对象和本次运行中私聊过的用户；"
+            "target_id 填 user_openid）："
+        ]
+        records.sort(key=lambda item: item["last_active"], reverse=True)
+        for record in records[:50]:
+            if record["id"] == self.official_sister_openid:
+                mark = " [姐姐/默认可转发]"
+            elif self.enable_arbitrary_friend_targets:
+                mark = " [可转发]"
+            else:
+                mark = ""
+            lines.append(
+                f"- {record['name'] or '未知昵称'} ({record['id']}){mark}，"
+                f"{self._format_elapsed(record['last_active'])}"
+            )
+        return "\n".join(lines)
+
+    def _format_official_group_members(
+        self, platform_id: str, target_id: str, keyword: str = "", limit: int = 50
+    ) -> str:
+        record = self._official_sessions.get(
+            self._build_session_id("GroupMessage", target_id, platform_id), {}
+        )
+        members = list((record.get("members") or {}).items())
+        if not members:
+            return (
+                "QQ 官方机器人无法读取群成员列表，本次运行中也还没有该群成员和 Bot 说过话。"
+            )
+
+        keyword = str(keyword or "").strip().lower()
+        limit = max(1, min(int(limit or 50), 200))
+        matched = [
+            (openid, name)
+            for openid, name in reversed(members)
+            if not keyword or keyword in f"{openid} {name}".lower()
+        ]
+        if not matched:
+            return f"没有找到匹配 `{keyword}` 的目标群成员。"
+        lines = [
+            "QQ 官方机器人无法读取完整群成员列表，以下是本次运行中和 Bot 说过话的成员"
+            "（按最近发言排序，括号内为 member_openid）："
+        ]
+        lines.extend(f"- {name} ({openid})" for openid, name in matched[:limit])
+        if len(matched) > limit:
+            lines.append(f"仅展示前 {limit} 项，匹配 {len(matched)} 项。")
+        return "\n".join(lines)
+
+    def _build_guarantee_prompt(self, count: int, kind: str) -> str:
+        _, sister_id, _ = self._target_policy(kind)
         target_hint = (
-            f"你可以优先考虑联系姐姐({self.sister_qq})的私聊会话，"
+            f"你可以优先考虑联系姐姐({sister_id})的私聊会话，"
             "也可以选择与内容和关系更匹配的白名单群或允许的好友会话。"
-            if self.sister_qq
+            if sister_id
             else "请选择与内容和关系匹配的白名单群或允许的好友会话。"
+        )
+        forward_hint = (
+            "如果要保留聊天记录形式，可选择提示中的 forward_1，或把多个 message_* 整理到 forward_refs；"
+            if kind == "onebot"
+            else ""
         )
         return (
             "[插件临时上下文｜非用户原话]\n"
@@ -2792,7 +3006,7 @@ class GossipSharer(Star):
             "如果符合你的人设、关系和当下语境，可以主动调用 `wake_qq_session_task`，"
             "不必等待用户明确说出“转发”“告诉她”或“发过去”。"
             f"{target_hint}"
-            "如果要保留聊天记录形式，可选择提示中的 forward_1，或把多个 message_* 整理到 forward_refs；"
+            f"{forward_hint}"
             "请在 task 中写清目标会话里的你应如何自然表达和处理；"
             "如果确实没有值得分享的内容，正常回复即可，不要提及这条内部提醒。"
         )
@@ -2846,6 +3060,45 @@ class GossipSharer(Star):
         )
         return "\n".join(lines)
 
+    def _attach_official_raw_message(
+        self,
+        platform,
+        message: AstrBotMessage,
+        target_type: str,
+        target_id: str,
+        requester_id: str,
+    ) -> None:
+        """Give a synthetic event the botpy source the QQ Official adapter replies to.
+
+        QQ 官方适配器只认 botpy 消息对象。目标会话在被动回复窗口内有真实消息时，
+        复用它的 ID 走被动回复；否则保留合成 ID，适配器被动回复失败后会自动改走主动推送。
+        """
+
+        # botpy 导入时会改 root logging，只在官方平台已加载时按需导入。
+        import botpy.message
+
+        record = self._official_sessions.get(
+            self._build_session_id(target_type, target_id, platform.meta().id), {}
+        )
+        if (
+            time.time() - record.get("last_active", 0)
+            < OFFICIAL_REPLY_WINDOW_SECONDS[target_type]
+        ):
+            message.message_id = record["last_message_id"] or message.message_id
+
+        data = {"id": message.message_id, "content": message.message_str}
+        if target_type == "GroupMessage":
+            data["group_openid"] = target_id
+            data["author"] = {"member_openid": requester_id}
+            message.raw_message = botpy.message.GroupMessage(
+                platform.client.api, None, data
+            )
+        else:
+            data["author"] = {"user_openid": target_id}
+            message.raw_message = botpy.message.C2CMessage(
+                platform.client.api, None, data
+            )
+
     async def _build_qq_task_wake_event(
         self,
         platform,
@@ -2871,7 +3124,10 @@ class GossipSharer(Star):
         requester_name = str(
             task_payload.get("requester_name") or requester_id or "跨会话任务"
         ).strip()
-        self_id = await self._resolve_qq_self_id(platform)
+        is_official = self._platform_kind(platform) == "official"
+        self_id = (
+            "qq_official" if is_official else await self._resolve_qq_self_id(platform)
+        )
         task_text = self._build_target_task_text(task_payload)
 
         message = AstrBotMessage()
@@ -2901,6 +3157,10 @@ class GossipSharer(Star):
             # The original requester remains available in DELEGATED_TASK_EXTRA.
             message.sender = MessageMember(user_id=target_id, nickname=target_id)
         message.session_id = target_id
+        if is_official:
+            self._attach_official_raw_message(
+                platform, message, target_type, target_id, requester_id
+            )
 
         target_event = platform.create_event(message)
         target_event.set_extra(SYNTHETIC_EVENT_EXTRA, True)
@@ -2937,50 +3197,28 @@ class GossipSharer(Star):
                 f"收到的对象类型：{self._describe_event_like(original_event)}。"
             )
 
-        try:
-            if event.get_platform_name() != "aiocqhttp":
-                return (
-                    "唤醒失败：目标会话任务当前只支持 QQ OneBot(aiocqhttp) 来源事件，"
-                    f"实际来源平台为 {event.get_platform_name()}。"
-                )
-        except Exception:
-            return "唤醒失败：无法识别当前来源平台。"
+        platform, kind, error = self._resolve_target_platform(event, target_platform)
+        if error:
+            return f"唤醒失败：{error}"
+        platform_id = platform.meta().id
 
         requester_id, requester_name = self._get_effective_requester(event)
         if not requester_id:
-            return "唤醒失败：无法识别请求者 QQ。"
+            return "唤醒失败：无法识别请求者。"
 
         target_type = self._normalize_target_type_name(target_type, "GroupMessage")
         target_id = str(target_id or "").strip()
         task = str(task or "").strip()
-        platform_id = self._effective_target_platform_id(event, target_platform)
         if not task:
             return "唤醒失败：task 不能为空。"
-        if not platform_id:
-            return "唤醒失败：未配置默认平台 ID，也无法从当前 QQ 事件推断目标平台。"
-        if target_type not in ("GroupMessage", "FriendMessage"):
-            return "唤醒失败：target_type 只允许为 FriendMessage 或 GroupMessage。"
+        if kind == "official" and self._normalize_attachment_refs(forward_refs):
+            return "唤醒失败：QQ 官方机器人不支持合并聊天记录，请去掉 forward_refs 后重试。"
 
-        error = self._validate_target(target_type, target_id, platform_id)
+        error = self._validate_target(target_type, target_id, kind)
         if error:
             return error.replace("发送失败：", "唤醒失败：", 1)
 
         session_id = self._build_session_id(target_type, target_id, platform_id)
-        if not session_id:
-            return "唤醒失败：无法构造目标会话。"
-
-        platform = self._get_platform_by_id(platform_id)
-        if platform is None:
-            return f"唤醒失败：未找到目标平台 {platform_id}。"
-        try:
-            platform_meta = platform.meta()
-        except Exception:
-            return "唤醒失败：无法读取目标平台信息。"
-        if platform_meta.name != "aiocqhttp":
-            return (
-                "唤醒失败：目标会话 LLM 唤醒只支持 QQ OneBot(aiocqhttp)，"
-                f"实际平台为 {platform_meta.name}。"
-            )
 
         # 同一请求者在短时间内对同一目标提交相同任务时，只允许首次投递。
         # 签名有意不包含附件/转发参数，避免模型换一种参数写法绕过去重。
@@ -3115,7 +3353,7 @@ class GossipSharer(Star):
                 or prepared.get("files")
                 or prepared.get("forwards")
             )
-            delivered = await self._send_wake_payloads(session_id, prepared)
+            delivered = await self._send_wake_payloads(event, session_id, prepared)
             if not delivered and has_pending:
                 logger.warning(f"目标平台未接受{label}跨会话内容: {session_id}")
                 return
@@ -3190,6 +3428,8 @@ class GossipSharer(Star):
         """
         try:
             event = self._unwrap_message_event(event)
+            if self._event_kind(event) == "official":
+                return await self._format_official_groups(event)
             group_data = await self._try_get_group_list(event)
             formatted = self._format_group_list(group_data)
 
@@ -3218,6 +3458,8 @@ class GossipSharer(Star):
         """
         try:
             event = self._unwrap_message_event(event)
+            if self._event_kind(event) == "official":
+                return self._format_official_friends(event)
             friend_data = await self._try_get_friend_list(event)
             formatted = self._format_friend_list(friend_data)
             if formatted:
@@ -3244,18 +3486,28 @@ class GossipSharer(Star):
         获取目标群聊成员列表，用于转发消息前确认应该 at 哪些目标会话成员。
 
         Args:
-            target_id (str): 目标群号。该群必须在群白名单中。
-            target_platform (str): 可选。平台 ID。默认使用配置值 default_platform。
+            target_id (str): 目标群号；QQ 官方机器人平台下为 group_openid。该群必须在群白名单中。
+            target_platform (str): 可选。平台 ID。默认使用当前会话所在平台。
             keyword (str): 可选。按 QQ、群名片或昵称过滤成员。
             limit (int): 可选。最多展示多少名成员，默认 50，最大 200。
         """
         try:
             event = self._unwrap_message_event(event)
-            error = self._validate_target("GroupMessage", target_id, target_platform)
+            target_id = str(target_id or "").strip()
+            platform, kind, error = self._resolve_target_platform(
+                event, target_platform
+            )
+            if error:
+                return f"获取目标群成员失败：{error}"
+            error = self._validate_target("GroupMessage", target_id, kind)
             if error:
                 return error
+            if kind == "official":
+                return self._format_official_group_members(
+                    platform.meta().id, target_id, keyword, limit
+                )
             member_data = await self._try_get_target_group_members(
-                target_id, target_platform
+                target_id, platform.meta().id
             )
             formatted = self._format_target_group_members(member_data, keyword, limit)
             if formatted:
@@ -3299,7 +3551,7 @@ class GossipSharer(Star):
             target_type (str): 消息类型。'FriendMessage' (私聊) 或 'GroupMessage' (群聊)。
             target_id (str): 接收目标的 QQ 号或群号。默认安全策略下，私聊只允许配置的姐姐 QQ。
             content (str): 可选。要发送的文字内容。
-            target_platform (str): 可选。平台 ID。默认使用配置值 default_platform。
+            target_platform (str): 可选。平台 ID。默认使用当前会话所在平台。
             image_url (str): 可选。要发送的 HTTP/HTTPS 图片链接。
             image_path (str): 可选。要发送的 Bot 本地可读图片路径。
             image_base64 (str): 可选。要发送的图片 base64 内容，可带或不带 data:image 前缀。
@@ -3352,13 +3604,13 @@ class GossipSharer(Star):
         回复发送完成后投递，图片仍会先提供给目标 LLM 识别。
 
         Args:
-            target_id (str): 目标 QQ 群号或好友 QQ。群目标必须在白名单中；私聊目标遵循私聊安全配置。
+            target_id (str): 目标 QQ 群号或好友 QQ；QQ 官方机器人平台下为 group_openid 或 user_openid，可先用 get_available_groups / get_friend_list 查询。群目标必须在白名单中；私聊目标遵循私聊安全配置。
             task (str): 目标 LLM 要完成的自然语言行动。
             target_type (str): 目标会话类型。支持 GroupMessage 和 FriendMessage，默认 GroupMessage。
-            target_platform (str): 可选。QQ 平台 ID。默认使用 default_platform；未配置时尝试使用当前 QQ 平台。
+            target_platform (str): 可选。平台 ID，必须与当前会话属于同一类 QQ 适配器。默认使用当前会话所在平台。
             image_refs (list[string]): 可选。要主动发送的图片引用。本轮当前消息或引用消息中的图片必须使用提示提供的 image_1 这类短引用；历史 media_image 临时路径仅在能精确映射到本轮附件时兼容，否则整次唤醒失败。也支持允许路径、URL 或 base64。
             file_refs (list[string]): 可选。要主动发送的文件短引用、允许路径或 HTTP/HTTPS URL。
-            forward_refs (list[string]): 可选。要发送为原生 QQ 合并聊天记录的来源引用。使用提示中列出的 forward_1（已有合并记录）或 message_1、message_2（零散消息）；多个引用会按顺序整理成一张可展开卡片。
+            forward_refs (list[string]): 可选。要发送为原生 QQ 合并聊天记录的来源引用，QQ 官方机器人平台不支持。使用提示中列出的 forward_1（已有合并记录）或 message_1、message_2（零散消息）；多个引用会按顺序整理成一张可展开卡片。
         """
         try:
             result = await self._safe_wake_qq_session_task(
@@ -3390,6 +3642,43 @@ class GossipSharer(Star):
             pass
         entries = self._build_capture_entries(event)
         self._store_captured_forward_sources(event, entries)
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=60)
+    async def record_official_sessions(self, event: AstrMessageEvent):
+        """Remember QQ Official groups, private chats and speakers seen at runtime."""
+
+        if self._event_kind(event) != "official" or self._is_synthetic_event(event):
+            return
+        raw = event.message_obj.raw_message
+        group_openid = getattr(raw, "group_openid", None)
+        user_openid = getattr(getattr(raw, "author", None), "user_openid", None)
+        if group_openid:
+            target_type, target_id = "GroupMessage", str(group_openid)
+        elif user_openid:
+            target_type, target_id = "FriendMessage", str(user_openid)
+        else:
+            # 频道消息不在本插件范围内。
+            return
+
+        record = self._official_session(event.get_platform_id(), target_type, target_id)
+        record["last_active"] = time.time()
+        record["last_message_id"] = str(event.message_obj.message_id or "")
+        sender_id = str(event.get_sender_id() or "")
+        sender_name = str(event.get_sender_name() or "")
+        if target_type == "FriendMessage":
+            record["name"] = sender_name or record["name"]
+            return
+
+        members = record["members"]
+        if sender_id:
+            members.pop(sender_id, None)
+            members[sender_id] = sender_name or sender_id
+            if len(members) > OFFICIAL_SEEN_MEMBERS_LIMIT:
+                members.pop(next(iter(members)))
+        group = event.message_obj.group
+        if not record["name"] and group and group.group_name:
+            record["name"] = group.group_name
+        await self._ensure_official_group_name(event.bot, record)
 
     @filter.on_llm_request()
     async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -3461,7 +3750,9 @@ class GossipSharer(Star):
                 TextPart(text=forward_catalog).mark_as_temp()
             )
 
-        if self.guarantee_threshold <= 0:
+        # 只在插件能唤醒的 QQ 平台上提醒，其他平台调用 wake 也必然失败。
+        kind = self._event_kind(event)
+        if self.guarantee_threshold <= 0 or not kind:
             return
 
         event_key = self._event_key(event)
@@ -3471,7 +3762,7 @@ class GossipSharer(Star):
             return
 
         self.no_share_counts[event_key] = 0
-        prompt = self._build_guarantee_prompt(count)
+        prompt = self._build_guarantee_prompt(count, kind)
         reminder_part = TextPart(text=prompt).mark_as_temp()
         if self.guarantee_injection_method in {
             "user_message_before",

@@ -3,13 +3,13 @@
         "type": "string",
         "default": "",
         "description": "默认 QQ 平台 ID",
-        "hint": "跨会话发送和唤醒默认使用的平台实例 ID。留空时，工具会尝试从当前 QQ 事件推断；无法推断时必须显式传入 target_platform。"
+        "hint": "留空即可：默认跟随当前会话所在平台。填写后仅在与来源会话同一类适配器（OneBot 或 QQ 官方机器人）时生效，用于把唤醒投递到同类的另一个平台实例；OneBot 与 QQ 官方机器人之间永远不会互相投递。"
     },
     "sister_qq": {
         "type": "string",
         "default": "",
-        "description": "默认私聊对象 QQ",
-        "hint": "默认的私聊转发和私聊唤醒目标。关闭“允许任意好友私聊”时，FriendMessage 只能发送或唤醒此 QQ。"
+        "description": "OneBot 默认私聊对象 QQ",
+        "hint": "OneBot(aiocqhttp) 平台的默认私聊转发和私聊唤醒目标。关闭“允许任意好友私聊”时，FriendMessage 只能发送或唤醒此 QQ。"
     },
     "group_whitelist": {
         "type": "list",
@@ -17,14 +17,29 @@
             "type": "string"
         },
         "default": [],
-        "description": "额外群白名单",
-        "hint": "允许跨会话发送和唤醒的 QQ 群号。这里的群号会与 soft_whitelist 插件的 group_whitelist 自动合并并去重。"
+        "description": "OneBot 额外群白名单",
+        "hint": "OneBot(aiocqhttp) 平台允许跨会话发送和唤醒的 QQ 群号。这里的群号会与 soft_whitelist 插件的 group_whitelist 自动合并并去重。"
+    },
+    "official_sister_openid": {
+        "type": "string",
+        "default": "",
+        "description": "QQ 官方机器人默认私聊对象 openid",
+        "hint": "QQ 官方机器人平台的默认私聊目标，填对方与 Bot 私聊时的 user_openid（可在私聊中发送 /sid 查看会话 ID 最后一段）。关闭“允许任意好友私聊”时，官方平台的 FriendMessage 只能唤醒此 openid。"
+    },
+    "official_group_whitelist": {
+        "type": "list",
+        "items": {
+            "type": "string"
+        },
+        "default": [],
+        "description": "QQ 官方机器人群白名单",
+        "hint": "QQ 官方机器人平台允许跨会话唤醒的群 group_openid（可在群里发送 /sid 查看会话 ID 最后一段）。与 OneBot 群白名单相互独立，不读取 soft_whitelist。"
     },
     "enable_arbitrary_friend_targets": {
         "type": "bool",
         "default": false,
         "description": "允许任意好友私聊",
-        "hint": "开启后，wake_qq_session_task 可进入任意好友的 FriendMessage 会话；关闭时仅允许“默认私聊对象 QQ”。插件内部附件投递同样遵循此限制。",
+        "hint": "开启后，wake_qq_session_task 可进入任意好友的 FriendMessage 会话；关闭时 OneBot 仅允许“OneBot 默认私聊对象 QQ”，QQ 官方机器人仅允许“QQ 官方机器人默认私聊对象 openid”。插件内部附件投递同样遵循此限制。",
         "obvious_hint": true
     },
     "enable_target_session_tasks": {
@@ -50,7 +65,7 @@
         "type": "bool",
         "default": true,
         "description": "允许 wake 携带合并聊天记录",
-        "hint": "开启后，Bot 可在 wake_qq_session_task 的 forward_refs 或 forward_items 中选择、整理 QQ 原生合并聊天记录。目标 LLM 回复完成后才投递可展开卡片；关闭后相关参数会被拒绝。",
+        "hint": "开启后，Bot 可在 wake_qq_session_task 的 forward_refs 或 forward_items 中选择、整理 QQ 原生合并聊天记录。目标 LLM 回复完成后才投递可展开卡片；关闭后相关参数会被拒绝。仅 OneBot 平台可用，QQ 官方机器人不支持合并转发。",
         "obvious_hint": true
     },
     "allow_remote_attachment_urls": {
