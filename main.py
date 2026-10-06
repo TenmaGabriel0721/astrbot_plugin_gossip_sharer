@@ -140,10 +140,6 @@ class GossipSharer(Star):
         # QQ 官方接口拿不到群/好友列表，按会话记录运行期间见过的群和私聊。
         self._official_sessions: dict[str, dict] = {}
 
-        if not self.default_platform:
-            logger.warning(
-                "转发告状工具未配置 default_platform，发送时需要显式传入 target_platform"
-            )
         if not self.sister_qq:
             logger.warning(
                 "转发告状工具未配置 sister_qq，默认私聊目标与保底提示将不可用"
@@ -2861,12 +2857,12 @@ class GossipSharer(Star):
     async def _ensure_official_group_name(self, client, record: dict) -> None:
         """Fill a group name via ``GET /v2/groups/{group_openid}/info`` once per run."""
 
-        # botpy 导入时会改 root logging，只在官方平台已加载时按需导入。
-        from botpy.http import Route
-
         if record["name"] or record["name_checked"]:
             return
         record["name_checked"] = True
+        # botpy 导入时会改 root logging，只在官方平台已加载时按需导入。
+        from botpy.http import Route
+
         try:
             payload = await client.api._http.request(
                 Route(
@@ -2909,9 +2905,11 @@ class GossipSharer(Star):
             "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为白名单群和本次运行中收到过消息的群；"
             "target_id 填 group_openid。超过 5 分钟没有新消息的群只能主动推送，可能受平台限制）："
         ]
-        records.sort(key=lambda item: item["last_active"], reverse=True)
-        for record in records[:50]:
-            await self._ensure_official_group_name(event.bot, record)
+        records = sorted(records, key=lambda item: item["last_active"], reverse=True)[:50]
+        await asyncio.gather(
+            *(self._ensure_official_group_name(event.bot, record) for record in records)
+        )
+        for record in records:
             status = " [白名单可转发]" if record["id"] in whitelist else ""
             lines.append(
                 f"- {record['name'] or '未知群名'} ({record['id']}){status}，"
