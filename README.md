@@ -64,7 +64,7 @@
 ### QQ 官方机器人说明
 
 - 目标 ID 均为 openid：群用 `group_openid`，私聊用 `user_openid`。可在对应会话中发送 `/sid` 查看，或让 Bot 调用 `get_available_groups` / `get_friend_list`。
-- 官方接口不提供群列表、好友列表和群成员列表。插件会记录本次运行中收到过消息的群和私聊，并通过 `GET /v2/groups/{group_openid}/info` 补全群名；`get_available_groups`、`get_friend_list` 返回这些记录加上白名单配置，`get_target_group_members` 直接返回不支持。
+- 官方接口不提供群列表、好友列表和群成员列表。插件会记录本次运行中收到过消息的群和私聊，并通过 `GET /v2/groups/{group_openid}/info` 补全群名；`get_available_groups`、`get_friend_list` 返回这些记录加上白名单配置，`get_target_group_members` 在官方会话中不会出现在 LLM 的工具列表里。
 - 目标会话在被动回复有效期内（群聊 5 分钟、私聊 60 分钟）有新消息时，插件复用该消息 ID 被动回复；否则由 AstrBot 适配器改走主动推送，能否送达取决于平台对主动消息的限制。
 - 不支持合并聊天记录，传入 `forward_refs` 会直接返回失败；图片和文件仍会投递，但群文件能否发出取决于平台是否开放该能力。
 - 私聊目标超过 60 分钟没有新消息且开启了流式输出时，回复依赖平台是否接受无 `msg_id` 的流式消息，建议对官方平台关闭流式输出。

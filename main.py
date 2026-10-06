@@ -3659,6 +3659,9 @@ class GossipSharer(Star):
 
     @filter.on_llm_request()
     async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
+        if self._event_kind(event) == "official" and req.func_tool:
+            # 官方平台没有群成员接口，本次请求不向 LLM 暴露该工具。
+            req.func_tool.remove_tool("get_target_group_members")
         if self._is_synthetic_event(event):
             return
 
