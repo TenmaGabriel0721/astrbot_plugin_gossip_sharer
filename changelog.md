@@ -6,8 +6,9 @@
 - OneBot 与 QQ 官方机器人可同时启用，插件按来源会话所在平台分别工作，两类适配器之间不互相投递；`default_platform` 只在与来源同类时生效，留空即跟随当前会话平台。
 - 新增 `official_group_whitelist`、`official_sister_openid` 配置，官方平台的群白名单和默认私聊对象与 OneBot 相互独立。
 - 官方平台合成事件携带 botpy 消息源，被动回复窗口内复用目标会话最近的消息 ID，否则交由适配器改走主动推送；回复后的附件也走同一条链路。
-- 官方平台的 `get_available_groups`、`get_friend_list`、`get_target_group_members` 改为返回白名单与本次运行中见过的群、私聊和发言成员，群名通过 `/v2/groups/{group_openid}/info` 获取。
-- 官方平台拒绝 `forward_refs`，保底提醒按平台提示对应的姐姐，且只在 OneBot 与 QQ 官方机器人会话中注入。
+- 官方平台的 `get_available_groups`、`get_friend_list` 返回白名单与本次运行中见过的群和私聊，群名通过 `/v2/groups/{group_openid}/info` 获取；`get_target_group_members` 在官方平台返回不支持。
+- 官方平台拒绝 `forward_refs`，保底提醒按平台提示对应的姐姐。
+- 新增 `sister_title` 配置，可自定义默认私聊对象的称呼，默认“姐姐”。
 
 ## v1.9.3
 

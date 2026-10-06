@@ -27,6 +27,7 @@
 | 配置项 | 类型 | 描述 |
 | :--- | :--- | :--- |
 | `default_platform` | string | 可留空，默认跟随当前会话所在平台。填写后仅在与来源会话同一类适配器时生效，用于投递到同类的另一个平台实例。 |
+| `sister_title` | string | 默认私聊对象的称呼，出现在保底提醒和好友列表中，默认“姐姐”。下文的“姐姐”均指这个称呼。 |
 | `sister_qq` | string | OneBot 平台姐姐的 QQ 号，作为告状和保底提示的首选私聊目标。默认安全策略下，私聊只允许发给该 QQ。 |
 | `group_whitelist` | list | OneBot 平台额外允许转发消息的群号列表，会与软白名单插件的群白名单合并。 |
 | `official_sister_openid` | string | QQ 官方机器人平台姐姐的 `user_openid`，作用同 `sister_qq`。 |
@@ -58,16 +59,15 @@
 - 唤醒目标默认就是来源会话所在的平台实例；显式指定的 `target_platform` 或 `default_platform` 必须与来源属于同一类适配器，OneBot 与 QQ 官方机器人之间不互相投递。
 - 白名单和默认私聊对象分开配置：OneBot 使用 `group_whitelist`、`sister_qq`（QQ 号），QQ 官方机器人使用 `official_group_whitelist`、`official_sister_openid`（openid）。
 - 合并聊天记录捕获、OneBot 接口调用只作用于 OneBot 平台；QQ 官方机器人的会话记录只作用于官方平台。
-- 保底提醒按平台提示对应的姐姐，其他平台不会注入提醒。
+- 保底提醒按平台提示对应的姐姐。
 
 ### QQ 官方机器人说明
 
 - 目标 ID 均为 openid：群用 `group_openid`，私聊用 `user_openid`。可在对应会话中发送 `/sid` 查看，或让 Bot 调用 `get_available_groups` / `get_friend_list`。
-- 官方接口不提供群列表、好友列表和群成员列表。插件会记录本次运行中收到过消息的群、私聊和群内发言成员，并通过 `GET /v2/groups/{group_openid}/info` 补全群名；三个查询工具返回的是这些记录加上白名单配置。
+- 官方接口不提供群列表、好友列表和群成员列表。插件会记录本次运行中收到过消息的群和私聊，并通过 `GET /v2/groups/{group_openid}/info` 补全群名；`get_available_groups`、`get_friend_list` 返回这些记录加上白名单配置，`get_target_group_members` 直接返回不支持。
 - 目标会话在被动回复有效期内（群聊 5 分钟、私聊 60 分钟）有新消息时，插件复用该消息 ID 被动回复；否则由 AstrBot 适配器改走主动推送，能否送达取决于平台对主动消息的限制。
 - 不支持合并聊天记录，传入 `forward_refs` 会直接返回失败；图片和文件仍会投递，但群文件能否发出取决于平台是否开放该能力。
 - 私聊目标超过 60 分钟没有新消息且开启了流式输出时，回复依赖平台是否接受无 `msg_id` 的流式消息，建议对官方平台关闭流式输出。
-- 群内 At 使用 `member_openid`，`get_target_group_members` 只能列出本次运行中和 Bot 说过话的成员。
 - 只支持 QQ 群和单聊，不支持频道。
 
 ## 工具说明
@@ -186,9 +186,9 @@ message_2: 防抖窗口内第二条可作为合并节点的零散消息
 
 ### `get_target_group_members`
 
-获取指定白名单群的成员列表，用于转发前确认目标会话里应该 @ 谁。
+获取指定白名单群的成员列表，用于转发前确认目标会话里应该 @ 谁。QQ 官方机器人平台不支持。
 
-- `target_id`: 目标群号（官方平台为 `group_openid`），必须在群白名单中
+- `target_id`: 目标群号，必须在群白名单中
 - `target_platform`: 可选，目标平台，必须与当前会话属于同一类适配器；不传时使用当前会话所在平台
 - `keyword`: 可选，按 QQ、群名片或昵称过滤
 - `limit`: 可选，最多展示多少名成员，默认 50，最大 200

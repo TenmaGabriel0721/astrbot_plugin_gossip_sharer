@@ -5,6 +5,12 @@
         "description": "默认 QQ 平台 ID",
         "hint": "留空即可：默认跟随当前会话所在平台。填写后仅在与来源会话同一类适配器（OneBot 或 QQ 官方机器人）时生效，用于把唤醒投递到同类的另一个平台实例；OneBot 与 QQ 官方机器人之间永远不会互相投递。"
     },
+    "sister_title": {
+        "type": "string",
+        "default": "姐姐",
+        "description": "默认私聊对象的称呼",
+        "hint": "Bot 对默认私聊对象（sister_qq / official_sister_openid）的称呼，会出现在保底提醒和好友列表中。留空时使用“姐姐”。"
+    },
     "sister_qq": {
         "type": "string",
         "default": "",

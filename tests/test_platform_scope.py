@@ -12,12 +12,11 @@ METHOD_NAMES = {
     "_platform_kind",
     "_event_kind",
     "_get_platform_by_id",
-    "_resolve_target_platform",
+    "_effective_target_platform_id",
     "_target_policy",
     "_validate_target",
     "_official_session",
     "_attach_official_raw_message",
-    "_format_official_group_members",
 }
 source_tree = ast.parse(PLUGIN_PATH.read_text(encoding="utf-8"))
 plugin_class = next(
@@ -118,6 +117,7 @@ def _make_plugin(default_platform: str = "") -> GossipSharer:
         platform_manager=SimpleNamespace(
             platform_insts=[
                 _FakePlatform("napcat", "aiocqhttp"),
+                _FakePlatform("napcat2", "aiocqhttp"),
                 _FakePlatform("official", "qq_official"),
                 _FakePlatform("tg", "telegram"),
             ]
@@ -137,32 +137,29 @@ def _make_plugin(default_platform: str = "") -> GossipSharer:
 class ResolveTargetPlatformTests(unittest.TestCase):
     def test_default_platform_of_other_adapter_is_ignored(self):
         plugin = _make_plugin(default_platform="napcat")
-        platform, kind, error = plugin._resolve_target_platform(
-            _FakeEvent("official", "qq_official")
+        self.assertEqual(
+            plugin._effective_target_platform_id(_FakeEvent("official", "qq_official")),
+            "official",
         )
-        self.assertEqual(error, "")
-        self.assertEqual(kind, "official")
-        self.assertEqual(platform.meta().id, "official")
 
         plugin = _make_plugin(default_platform="official")
-        platform, kind, error = plugin._resolve_target_platform(
-            _FakeEvent("napcat", "aiocqhttp")
+        self.assertEqual(
+            plugin._effective_target_platform_id(_FakeEvent("napcat", "aiocqhttp")),
+            "napcat",
         )
-        self.assertEqual((platform.meta().id, kind, error), ("napcat", "onebot", ""))
 
-    def test_explicit_cross_adapter_target_is_rejected(self):
-        plugin = _make_plugin()
-        platform, _, error = plugin._resolve_target_platform(
-            _FakeEvent("napcat", "aiocqhttp"), "official"
+    def test_default_platform_of_same_adapter_is_kept(self):
+        plugin = _make_plugin(default_platform="napcat2")
+        self.assertEqual(
+            plugin._effective_target_platform_id(_FakeEvent("napcat", "aiocqhttp")),
+            "napcat2",
         )
-        self.assertIsNone(platform)
-        self.assertIn("不互相投递", error)
 
-    def test_unsupported_source_is_rejected(self):
-        plugin = _make_plugin()
-        platform, _, error = plugin._resolve_target_platform(_FakeEvent("tg", "telegram"))
-        self.assertIsNone(platform)
-        self.assertIn("不受支持", error)
+    def test_unsupported_source_resolves_nothing(self):
+        plugin = _make_plugin(default_platform="napcat")
+        self.assertEqual(
+            plugin._effective_target_platform_id(_FakeEvent("tg", "telegram")), ""
+        )
 
 
 class TargetPolicyTests(unittest.TestCase):
@@ -174,9 +171,9 @@ class TargetPolicyTests(unittest.TestCase):
             self.plugin._validate_target("GroupMessage", "GROUPOPENID", "official")
         )
         self.assertIsNotNone(
-            self.plugin._validate_target("GroupMessage", "GROUPOPENID", "onebot")
+            self.plugin._validate_target("GroupMessage", "GROUPOPENID", "napcat")
         )
-        self.assertIsNone(self.plugin._validate_target("GroupMessage", "123456", "onebot"))
+        self.assertIsNone(self.plugin._validate_target("GroupMessage", "123456", "napcat"))
         self.assertIsNotNone(
             self.plugin._validate_target("GroupMessage", "123456", "official")
         )
@@ -187,7 +184,7 @@ class TargetPolicyTests(unittest.TestCase):
         )
         error = self.plugin._validate_target("FriendMessage", "10001", "official")
         self.assertIn("official_sister_openid", error)
-        self.assertIsNone(self.plugin._validate_target("FriendMessage", "10001", "onebot"))
+        self.assertIsNone(self.plugin._validate_target("FriendMessage", "10001", "napcat"))
 
 
 class OfficialRawMessageTests(unittest.TestCase):
@@ -231,14 +228,6 @@ class OfficialRawMessageTests(unittest.TestCase):
 
         self.assertIsInstance(message.raw_message, _FakeC2CMessage)
         self.assertEqual(message.raw_message.author.user_openid, "U1")
-
-    def test_seen_members_are_listed_latest_first(self):
-        record = self.plugin._official_session("official", "GroupMessage", "G1")
-        record["members"].update({"M1": "甲", "M2": "乙"})
-
-        text = self.plugin._format_official_group_members("official", "G1")
-
-        self.assertLess(text.index("乙 (M2)"), text.index("甲 (M1)"))
 
 
 if __name__ == "__main__":
