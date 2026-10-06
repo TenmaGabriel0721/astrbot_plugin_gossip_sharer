@@ -228,6 +228,18 @@ class OfficialRawMessageTests(unittest.TestCase):
 
         self.assertIsInstance(message.raw_message, _FakeC2CMessage)
         self.assertEqual(message.raw_message.author.user_openid, "U1")
+        self.assertIsNone(message.message_id)
+
+    def test_recent_private_message_is_reused_for_passive_reply(self):
+        record = self.plugin._official_session("official", "FriendMessage", "U1")
+        record.update(last_active=time.time() - 1800, last_message_id="REAL")
+        message = self._message()
+
+        self.plugin._attach_official_raw_message(
+            self.platform, message, "FriendMessage", "U1", "REQ"
+        )
+
+        self.assertEqual(message.message_id, "REAL")
 
 
 if __name__ == "__main__":

@@ -3040,7 +3040,8 @@ class GossipSharer(Star):
         """Give a synthetic event the botpy source the QQ Official adapter replies to.
 
         QQ 官方适配器只认 botpy 消息对象。目标会话在被动回复窗口内有真实消息时，
-        复用它的 ID 走被动回复；否则保留合成 ID，适配器被动回复失败后会自动改走主动推送。
+        复用它的 ID 走被动回复；否则单聊不带 msg_id 直接主动推送，群聊保留合成 ID，
+        由适配器在被动回复失败后改走主动推送。
         """
 
         # botpy 导入时会改 root logging，只在官方平台已加载时按需导入。
@@ -3054,6 +3055,9 @@ class GossipSharer(Star):
             < OFFICIAL_REPLY_WINDOW_SECONDS[target_type]
         ):
             message.message_id = record["last_message_id"] or message.message_id
+        elif target_type == "FriendMessage":
+            # 单聊可直接主动推送；带无效 msg_id 会被 AstrBot 的 C2C 发送重试三次后才降级。
+            message.message_id = None
 
         data = {"id": message.message_id, "content": message.message_str}
         if target_type == "GroupMessage":
