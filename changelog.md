@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## v2.0.0
 
 - 新增 QQ 官方机器人（`qq_official` / `qq_official_webhook`）支持：`wake_qq_session_task` 可在官方平台的群聊和单聊之间唤醒目标 LLM，并投递图片和文件。
 - OneBot 与 QQ 官方机器人可同时启用，插件按来源会话所在平台分别工作，两类适配器之间不互相投递；`default_platform` 只在与来源同类时生效，留空即跟随当前会话平台。
