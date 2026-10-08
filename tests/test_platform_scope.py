@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import sys
 import time
 import unittest
@@ -17,6 +18,7 @@ METHOD_NAMES = {
     "_validate_target",
     "_official_session",
     "_attach_official_raw_message",
+    "_track_official_delivery",
 }
 source_tree = ast.parse(PLUGIN_PATH.read_text(encoding="utf-8"))
 plugin_class = next(
@@ -43,11 +45,7 @@ constants = [
     and any(
         isinstance(target, ast.Name)
         and target.id
-        in {
-            "ONEBOT_ADAPTERS",
-            "OFFICIAL_ADAPTERS",
-            "OFFICIAL_REPLY_WINDOW_SECONDS",
-        }
+        in {"ONEBOT_ADAPTERS", "OFFICIAL_ADAPTERS"}
         for target in node.targets
     )
 ]
@@ -82,6 +80,7 @@ sys.modules["botpy"] = _fake_botpy
 sys.modules["botpy.message"] = _fake_botpy_message
 
 namespace = {
+    "asyncio": asyncio,
     "time": time,
     "AstrMessageEvent": object,
     "AstrBotMessage": object,
@@ -186,6 +185,14 @@ class TargetPolicyTests(unittest.TestCase):
         self.assertIn("official_sister_openid", error)
         self.assertIsNone(self.plugin._validate_target("FriendMessage", "10001", "napcat"))
 
+    def test_arbitrary_private_targets_do_not_need_sister(self):
+        self.plugin.official_sister_openid = ""
+        self.assertIsNotNone(
+            self.plugin._validate_target("FriendMessage", "U1", "official")
+        )
+        self.plugin.enable_arbitrary_friend_targets = True
+        self.assertIsNone(self.plugin._validate_target("FriendMessage", "U1", "official"))
+
 
 class OfficialRawMessageTests(unittest.TestCase):
     def setUp(self):
@@ -195,52 +202,53 @@ class OfficialRawMessageTests(unittest.TestCase):
     def _message(self):
         return SimpleNamespace(message_id="gossip-task-x", message_str="任务", raw_message=None)
 
-    def test_recent_group_message_is_reused_for_passive_reply(self):
-        record = self.plugin._official_session("official", "GroupMessage", "G1")
-        record.update(last_active=time.time(), last_message_id="REAL")
+    def test_group_target_keeps_synthetic_id_for_proactive_fallback(self):
         message = self._message()
-
-        self.plugin._attach_official_raw_message(
-            self.platform, message, "GroupMessage", "G1", "REQ"
-        )
-
-        self.assertEqual(message.message_id, "REAL")
-        self.assertIsInstance(message.raw_message, _FakeGroupMessage)
-        self.assertEqual(message.raw_message.group_openid, "G1")
-        self.assertEqual(message.raw_message.author.member_openid, "REQ")
-
-    def test_expired_message_keeps_synthetic_id(self):
-        record = self.plugin._official_session("official", "GroupMessage", "G1")
-        record.update(last_active=time.time() - 600, last_message_id="OLD")
-        message = self._message()
-
         self.plugin._attach_official_raw_message(
             self.platform, message, "GroupMessage", "G1", "REQ"
         )
 
         self.assertEqual(message.message_id, "gossip-task-x")
+        self.assertIsInstance(message.raw_message, _FakeGroupMessage)
+        self.assertEqual(message.raw_message.group_openid, "G1")
+        self.assertEqual(message.raw_message.author.member_openid, "REQ")
 
-    def test_private_target_routes_by_user_openid(self):
+    def test_private_target_is_sent_proactively(self):
         message = self._message()
         self.plugin._attach_official_raw_message(
             self.platform, message, "FriendMessage", "U1", "REQ"
         )
 
+        self.assertIsNone(message.message_id)
         self.assertIsInstance(message.raw_message, _FakeC2CMessage)
         self.assertEqual(message.raw_message.author.user_openid, "U1")
-        self.assertIsNone(message.message_id)
 
-    def test_recent_private_message_is_reused_for_passive_reply(self):
-        record = self.plugin._official_session("official", "FriendMessage", "U1")
-        record.update(last_active=time.time() - 1800, last_message_id="REAL")
-        message = self._message()
 
-        self.plugin._attach_official_raw_message(
-            self.platform, message, "FriendMessage", "U1", "REQ"
-        )
+class OfficialDeliveryTests(unittest.TestCase):
+    @staticmethod
+    def _deliver(post_send):
+        async def run():
+            event = SimpleNamespace(_post_send=post_send)
+            delivery = GossipSharer._track_official_delivery(event)
+            try:
+                await event._post_send()
+            except Exception:
+                pass
+            return await delivery
 
-        self.assertEqual(message.message_id, "REAL")
+        return asyncio.run(run())
 
+    def test_successful_send_resolves_without_error(self):
+        async def post_send():
+            return "ok"
+
+        self.assertIsNone(self._deliver(post_send))
+
+    def test_send_error_is_reported(self):
+        async def post_send():
+            raise RuntimeError("用户已关闭主动消息")
+
+        self.assertEqual(str(self._deliver(post_send)), "用户已关闭主动消息")
 
 if __name__ == "__main__":
     unittest.main()
