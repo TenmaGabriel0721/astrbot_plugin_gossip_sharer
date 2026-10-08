@@ -12,7 +12,7 @@
 - **安全附件引用**：当前消息与引用消息中的附件会获得 `image_1`、`file_1` 等短引用；生成文件只允许来自安全目录。
 - **稳定图片快照**：来源 LLM 请求阶段即保存本轮图片内容，后续工具调用不再依赖容易被清理的 `media_image_*` 临时路径。
 - **GIF 双轨处理**：来源和目标 LLM 只接收 GIF 第一帧 PNG，规避 Gemini 的 GIF MIME 限制；目标 QQ 仍收到原始动图。
-- **私聊目标安全开关**：默认只允许向 `sister_qq` 私聊转发；如确需任意私聊目标，可开启 `enable_arbitrary_friend_targets`。
+- **私聊目标安全开关**：默认只允许向对应平台的姐姐（`sister_qq` / `official_sister_openid`）私聊转发；如确需任意私聊目标，可开启 `enable_arbitrary_friend_targets`。
 - **群聊白名单**：`GroupMessage` 目标必须在群白名单内。
 - **软白名单联动**：自动读取 `astrbot_plugin_soft_whitelist_config.json` 的 `group_whitelist`，并与本插件配置的 `group_whitelist` 合并去重。
 - **保底提示**：按来源会话独立统计连续未分享次数，达到阈值时提示 Bot 自主判断是否通过 wake 去姐姐私聊。
@@ -26,10 +26,13 @@
 
 | 配置项 | 类型 | 描述 |
 | :--- | :--- | :--- |
-| `default_platform` | string | 默认平台 ID。留空时，调用工具必须显式传入 `target_platform`，避免误发到固定平台。 |
-| `sister_qq` | string | 姐姐的 QQ 号，作为告状和保底提示的首选私聊目标。默认安全策略下，私聊只允许发给该 QQ。 |
-| `group_whitelist` | list | 额外允许转发消息的群号列表，会与软白名单插件的群白名单合并。 |
-| `enable_arbitrary_friend_targets` | bool | 是否允许 `FriendMessage` 发送到任意私聊目标。默认 `false`，即只允许发送给 `sister_qq`。 |
+| `default_platform` | string | 可留空，默认跟随当前会话所在平台。填写后仅在与来源会话同一类适配器时生效，用于投递到同类的另一个平台实例。 |
+| `sister_title` | string | 默认私聊对象的称呼，出现在保底提醒和好友列表中，默认“姐姐”。下文的“姐姐”均指这个称呼。 |
+| `sister_qq` | string | OneBot 平台姐姐的 QQ 号，作为告状和保底提示的首选私聊目标。默认安全策略下，私聊只允许发给该 QQ。 |
+| `group_whitelist` | list | OneBot 平台额外允许转发消息的群号列表，会与软白名单插件的群白名单合并。 |
+| `official_sister_openid` | string | QQ 官方机器人平台姐姐的 `user_openid`，作用同 `sister_qq`。 |
+| `official_group_whitelist` | list | QQ 官方机器人平台允许唤醒的群 `group_openid`，与 OneBot 群白名单相互独立。 |
+| `enable_arbitrary_friend_targets` | bool | 是否允许 `FriendMessage` 发送到任意私聊目标。默认 `false`，即只允许发送给对应平台的姐姐。 |
 | `enable_target_session_tasks` | bool | 是否启用目标 QQ 群聊和私聊 LLM 唤醒。 |
 | `enable_wake_images` | bool | 是否允许 wake 主动选择并发送图片。 |
 | `enable_wake_files` | bool | 是否允许 wake 主动选择并发送文件。 |
@@ -47,7 +50,25 @@
 | `guarantee_threshold` | int | 每个来源会话连续多少次 LLM 请求未发起跨会话行动后提醒一次；触发后重新计数，默认 10，小于等于 0 表示关闭。 |
 | `guarantee_injection_method` | string | 主动社交提醒的注入位置：`extra_user_content`（推荐）、`user_message_before` 或 `user_message_after`。 |
 
-> 建议首次安装后手动配置 `default_platform` 与 `sister_qq`。插件不再内置固定平台 ID 或固定 QQ 号，避免复制部署时误发。
+> 建议首次安装后按实际使用的平台配置姐姐和群白名单。插件不内置固定平台 ID 或固定 QQ 号，避免复制部署时误发。
+
+## 平台支持
+
+插件同时支持 QQ OneBot(`aiocqhttp`) 与 QQ 官方机器人(`qq_official` / `qq_official_webhook`)。两类适配器可以在同一个 AstrBot 里同时启用，插件按来源会话所在平台各管各的：
+
+- 唤醒目标默认就是来源会话所在的平台实例；显式指定的 `target_platform` 或 `default_platform` 必须与来源属于同一类适配器，OneBot 与 QQ 官方机器人之间不互相投递。
+- 白名单和默认私聊对象分开配置：OneBot 使用 `group_whitelist`、`sister_qq`（QQ 号），QQ 官方机器人使用 `official_group_whitelist`、`official_sister_openid`（openid）。
+- 合并聊天记录捕获、OneBot 接口调用只作用于 OneBot 平台；QQ 官方机器人的会话记录只作用于官方平台。
+- 保底提醒按平台提示对应的姐姐。
+
+### QQ 官方机器人说明
+
+- 目标 ID 均为 openid：群用 `group_openid`，私聊用 `user_openid`。可在对应会话中发送 `/sid` 查看，或让 Bot 调用 `get_available_groups` / `get_friend_list`。
+- 官方接口不提供群列表、好友列表和群成员列表。插件会记录本次运行中收到过消息的群和私聊，并通过 `GET /v2/groups/{group_openid}/info` 补全群名；`get_available_groups`、`get_friend_list` 返回这些记录加上白名单配置，`get_target_group_members` 在官方会话中不会出现在 LLM 的工具列表里。
+- 目标会话在被动回复有效期内（群聊 5 分钟、私聊 60 分钟）有新消息时，插件复用该消息 ID 被动回复；否则由 AstrBot 适配器改走主动推送，能否送达取决于平台对主动消息的限制。
+- 不支持合并聊天记录，传入 `forward_refs` 会直接返回失败；图片和文件仍会投递，但群文件能否发出取决于平台是否开放该能力。
+- 私聊目标超过 60 分钟没有新消息且开启了流式输出时，回复依赖平台是否接受无 `msg_id` 的流式消息，建议对官方平台关闭流式输出。
+- 只支持 QQ 群和单聊，不支持频道。
 
 ## 工具说明
 
@@ -59,13 +80,13 @@
 
 把一条跨会话任务作为目标 QQ 群聊或私聊里的合成唤醒事件投递给目标会话 LLM。适合传话、打小报告、转述当前会话发生的事、请目标会话回应，以及让目标 Bot 结合对应会话上下文处理任务。
 
-- `target_id`: 目标 QQ 群号或好友 QQ；群目标必须在群白名单中，私聊目标遵循私聊安全配置
+- `target_id`: 目标 QQ 群号或好友 QQ，QQ 官方机器人平台下为 `group_openid` / `user_openid`；群目标必须在群白名单中，私聊目标遵循私聊安全配置
 - `task`: 交给目标会话 LLM 执行的自然语言任务，需要包含用户原意和必要上下文
 - `target_type`: 支持 `GroupMessage` 和 `FriendMessage`，默认 `GroupMessage`
-- `target_platform`: 可选，目标平台；不传时使用 `default_platform`
+- `target_platform`: 可选，目标平台，必须与当前会话属于同一类适配器；不传时使用当前会话所在平台
 - `image_refs`: 可选，Bot 主动选择要发送的图片短引用、允许路径、URL 或 base64 引用
 - `file_refs`: 可选，Bot 主动选择要发送的文件短引用、允许路径或 HTTP/HTTPS URL
-- `forward_refs`: 可选，选择当前提示中列出的 `forward_1`、`message_1` 等来源。多个来源会按顺序整理成一张原生 QQ 合并聊天记录。
+- `forward_refs`: 可选，仅 OneBot 平台可用，选择当前提示中列出的 `forward_1`、`message_1` 等来源。多个来源会按顺序整理成一张原生 QQ 合并聊天记录。
 - `forward_items`: 可选，用于手工整理节点的对象列表。每项可填写 `ref`/`message_ref`/`forward_ref`、`sender_ref`、`text`、`image_refs`、`file_refs`、`at_qqs`、`at_names`、`sender_name`、`sender_id`、`time`；`time` 同时接受 Unix 秒或毫秒时间戳。
 
 选择边界：
@@ -161,14 +182,14 @@ message_2: 防抖窗口内第二条可作为合并节点的零散消息
 
 ### `get_friend_list`
 
-尝试获取当前 Bot 所在平台支持的好友列表。若当前平台未实现好友列表接口，则返回降级提示；已配置的 `sister_qq` 仍可作为默认私聊目标参考。
+尝试获取当前 Bot 所在平台支持的好友列表。若当前平台未实现好友列表接口，则返回降级提示；已配置的 `sister_qq` 仍可作为默认私聊目标参考。QQ 官方机器人平台返回默认私聊对象和本次运行中私聊过的用户。
 
 ### `get_target_group_members`
 
-获取指定白名单群的成员列表，用于转发前确认目标会话里应该 @ 谁。
+获取指定白名单群的成员列表，用于转发前确认目标会话里应该 @ 谁。QQ 官方机器人平台不支持。
 
 - `target_id`: 目标群号，必须在群白名单中
-- `target_platform`: 可选，目标平台；不传时使用 `default_platform`
+- `target_platform`: 可选，目标平台，必须与当前会话属于同一类适配器；不传时使用当前会话所在平台
 - `keyword`: 可选，按 QQ、群名片或昵称过滤
 - `limit`: 可选，最多展示多少名成员，默认 50，最大 200
 
@@ -211,7 +232,7 @@ message_2: 防抖窗口内第二条可作为合并节点的零散消息
 
 - 群白名单读取使用 `utf-8-sig`，可兼容带 BOM 的 AstrBot 配置文件。
 - 软白名单配置缺失或读取失败时，会继续使用本插件配置的 `group_whitelist`。
-- 私聊消息默认仅允许发给 `sister_qq`，开启 `enable_arbitrary_friend_targets` 后才允许任意私聊目标。
-- 保底机制默认引导模型优先考虑向 `sister_qq` 分享内容。
+- 私聊消息默认仅允许发给对应平台的姐姐，开启 `enable_arbitrary_friend_targets` 后才允许任意私聊目标。
+- 保底机制默认引导模型优先考虑向当前平台的姐姐分享内容。
 - `send_cross_message` 保留为内部方法，不再出现在 LLM 工具列表中。
 - 插件不加入跨会话跳数、循环追踪或长期 relay 状态机制。
