@@ -58,8 +58,8 @@ WAKE_DEDUP_WINDOW_SECONDS = 30
 ONEBOT_ADAPTERS = {"aiocqhttp"}
 OFFICIAL_ADAPTERS = {"qq_official", "qq_official_webhook"}
 
-# QQ 官方被动回复 msg_id 的有效期：群聊 5 分钟，单聊 60 分钟；过期后走主动推送。
-OFFICIAL_REPLY_WINDOW_SECONDS = {"GroupMessage": 300, "FriendMessage": 3600}
+# QQ 官方跨会话消息走主动推送，唤醒工具最多等这么久确认目标回复是否发出。
+OFFICIAL_DELIVERY_TIMEOUT_SECONDS = 60
 
 
 @register(
@@ -335,7 +335,7 @@ class GossipSharer(Star):
         if target_type == "GroupMessage" and str(target_id) not in group_whitelist:
             return f"发送失败：群 {target_id} 不在白名单里。"
         if target_type == "FriendMessage":
-            if not sister_id:
+            if not sister_id and not self.enable_arbitrary_friend_targets:
                 return f"发送失败：未配置 {sister_key}，无法校验默认私聊目标。"
             if (
                 not self.enable_arbitrary_friend_targets
@@ -2850,7 +2850,6 @@ class GossipSharer(Star):
                 "name": "",
                 "name_checked": False,
                 "last_active": 0.0,
-                "last_message_id": "",
             },
         )
 
@@ -2903,7 +2902,7 @@ class GossipSharer(Star):
 
         lines = [
             "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为白名单群和本次运行中收到过消息的群；"
-            "target_id 填 group_openid。超过 5 分钟没有新消息的群只能主动推送，可能受平台限制）："
+            "target_id 填 group_openid）："
         ]
         records = sorted(records, key=lambda item: item["last_active"], reverse=True)[:50]
         await asyncio.gather(
@@ -3037,24 +3036,14 @@ class GossipSharer(Star):
     ) -> None:
         """Give a synthetic event the botpy source the QQ Official adapter replies to.
 
-        QQ 官方适配器只认 botpy 消息对象。目标会话在被动回复窗口内有真实消息时，
-        复用它的 ID 走被动回复；否则单聊不带 msg_id 直接主动推送，群聊保留合成 ID，
-        由适配器在被动回复失败后改走主动推送。
+        QQ 官方适配器只认 botpy 消息对象。跨会话消息一律主动推送：单聊不带 msg_id；
+        群聊发送会原样带上 msg_id，保留合成 ID，由适配器在被动回复失败后去掉它改走主动推送。
         """
 
         # botpy 导入时会改 root logging，只在官方平台已加载时按需导入。
         import botpy.message
 
-        record = self._official_sessions.get(
-            self._build_session_id(target_type, target_id, platform.meta().id), {}
-        )
-        if (
-            time.time() - record.get("last_active", 0)
-            < OFFICIAL_REPLY_WINDOW_SECONDS[target_type]
-        ):
-            message.message_id = record["last_message_id"] or message.message_id
-        elif target_type == "FriendMessage":
-            # 单聊可直接主动推送；带无效 msg_id 会被 AstrBot 的 C2C 发送重试三次后才降级。
+        if target_type == "FriendMessage":
             message.message_id = None
 
         data = {"id": message.message_id, "content": message.message_str}
@@ -3069,6 +3058,30 @@ class GossipSharer(Star):
             message.raw_message = botpy.message.C2CMessage(
                 platform.client.api, None, data
             )
+
+    @staticmethod
+    def _track_official_delivery(target_event) -> asyncio.Future:
+        """Resolve with the first send error of a synthetic QQ Official event, or None.
+
+        AstrBot 发送失败只会记日志，这里接住适配器的发送入口，让唤醒工具能把 QQ 返回的原因交给 Bot。
+        """
+
+        delivery = asyncio.get_running_loop().create_future()
+        post_send = target_event._post_send
+
+        async def tracked_post_send(*args, **kwargs):
+            try:
+                ret = await post_send(*args, **kwargs)
+            except Exception as e:
+                if not delivery.done():
+                    delivery.set_result(e)
+                raise
+            if not delivery.done():
+                delivery.set_result(None)
+            return ret
+
+        target_event._post_send = tracked_post_send
+        return delivery
 
     async def _build_qq_task_wake_event(
         self,
@@ -3304,6 +3317,11 @@ class GossipSharer(Star):
                 ],
             )
             target_event.set_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, prepared)
+            delivery = (
+                self._track_official_delivery(target_event)
+                if kind == "official"
+                else None
+            )
             platform.commit_event(target_event)
             await self._commit_wake_signature(wake_signature)
         except Exception as e:
@@ -3317,10 +3335,20 @@ class GossipSharer(Star):
             f"requester={requester_id}, task={task}, "
             f"forward_nodes={sum(item.get('node_count', 0) for item in prepared['forwards'])}"
         )
-        self._reset_no_share_count(event)
         result = f"{session_id} <- {task}"
         if attachment_summary:
             result += f"\n{attachment_summary}"
+        if delivery is not None:
+            try:
+                error = await asyncio.wait_for(
+                    delivery, OFFICIAL_DELIVERY_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                result += "\n目标会话暂未发出回复，还不能确认对方是否收到。"
+            else:
+                if error:
+                    return f"唤醒失败：目标会话的回复没有发出去，QQ 返回：{error}"
+        self._reset_no_share_count(event)
         return result
 
     async def _deliver_pending_wake_payloads(
@@ -3591,6 +3619,8 @@ class GossipSharer(Star):
         才传入当前提示中列出的 image_refs、file_refs 或 forward_refs；
         未选择的内容不会自动发送。选中的图片、文件和合并聊天记录会在目标 LLM
         回复发送完成后投递，图片仍会先提供给目标 LLM 识别。
+        QQ 官方机器人平台会等目标回复发出后再返回；发送失败时会返回 QQ 给出的原因，
+        例如对方没有添加机器人或关闭了主动消息。
 
         Args:
             target_id (str): 目标 QQ 群号或好友 QQ；QQ 官方机器人平台下为 group_openid 或 user_openid，可先用 get_available_groups / get_friend_list 查询。群目标必须在白名单中；私聊目标遵循私聊安全配置。
@@ -3651,7 +3681,6 @@ class GossipSharer(Star):
 
         record = self._official_session(event.get_platform_id(), target_type, target_id)
         record["last_active"] = time.time()
-        record["last_message_id"] = str(event.message_obj.message_id or "")
         if target_type == "FriendMessage":
             record["name"] = str(event.get_sender_name() or "") or record["name"]
             return
