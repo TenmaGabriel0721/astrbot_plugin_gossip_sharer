@@ -155,7 +155,7 @@ class WakeSnapshotTests(unittest.TestCase):
         self.plugin = GossipSharer.__new__(GossipSharer)
 
     def test_cleanup_is_idempotent(self):
-        with tempfile.TemporaryDirectory(dir="/root/.codex_claude_temp") as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:
             snapshot = Path(temp_dir) / "snapshot.bin"
             snapshot.write_bytes(b"payload")
             prepared = {"cleanup_paths": [snapshot]}

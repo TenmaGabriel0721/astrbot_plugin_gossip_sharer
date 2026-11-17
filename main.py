@@ -36,7 +36,7 @@ from astrbot.core.utils.astrbot_path import (
 )
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
-PLUGIN_VERSION = "1.9.3"
+PLUGIN_VERSION = "2.0.1"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 ATTACHMENT_REGISTRY_EXTRA = "gossip_sharer_attachment_registry"
@@ -46,6 +46,8 @@ PENDING_WAKE_ATTACHMENTS_EXTRA = "gossip_sharer_pending_wake_attachments"
 WAKE_ATTACHMENTS_SENT_EXTRA = "gossip_sharer_wake_attachments_sent"
 WAKE_ATTACHMENTS_SENDING_EXTRA = "gossip_sharer_wake_attachments_sending"
 WAKE_ATTACHMENTS_ATTEMPTED_EXTRA = "gossip_sharer_wake_attachments_attempted"
+TASK_RESULT_EXTRA = "gossip_sharer_task_result"
+TASK_RESULT_SENDING_EXTRA = "gossip_sharer_task_result_sending"
 
 FORWARD_CAPTURE_TTL_SECONDS = 180
 FORWARD_CAPTURE_MAX_MESSAGES = 30
@@ -276,6 +278,55 @@ class GossipSharer(Star):
             requester_name = requester_id
         return requester_id, requester_name
 
+    def _task_return_route(
+        self, event: AstrMessageEvent, *, validate: bool = True
+    ) -> tuple[str, str, str, str]:
+        """Resolve the original reply destination without applying platform defaults.
+
+        Args:
+            event: Current event or a delegated task carrying its original route.
+            validate: Whether to enforce the cross-session destination policy.
+
+        Returns:
+            Original UMO, message type, recipient ID, and platform instance ID.
+
+        Raises:
+            ValueError: If the route is invalid or violates destination policy.
+        """
+
+        payload = self._get_delegated_task_payload(event)
+        session_id = str(
+            payload.get("return_session")
+            or payload.get("source_session")
+            or self._event_key(event)
+        ).strip()
+        parts = session_id.split(":", 2)
+        if len(parts) != 3 or not all(parts):
+            raise ValueError("无法识别原始回传会话")
+        platform_id, target_type, session_target = parts
+        target_type = self._normalize_target_type_name(target_type)
+        target_id = str(payload.get("return_target_id") or session_target).strip()
+        if not payload.get("return_target_id"):
+            if session_id == self._event_key(event) and target_type == "GroupMessage":
+                target_id = str(
+                    getattr(event, "get_group_id", lambda: "")() or session_target
+                )
+            elif target_type == "GroupMessage" and self._event_kind(event) == "onebot":
+                # Per-member group sessions retain their complete UMO for sending.
+                target_id = session_target.rsplit("_", 1)[-1]
+        if target_type not in {"GroupMessage", "FriendMessage"}:
+            raise ValueError("回传会话必须是 QQ 群聊或私聊")
+        platform = self._get_platform_by_id(platform_id)
+        if not self._event_kind(event) or self._platform_kind(
+            platform
+        ) != self._event_kind(event):
+            raise ValueError("回传平台与当前会话不属于同一类 QQ 适配器")
+        if validate and session_id != self._event_key(event):
+            error = self._validate_target(target_type, target_id, platform_id)
+            if error:
+                raise ValueError(error.removeprefix("发送失败："))
+        return session_id, target_type, target_id, platform_id
+
     def _reset_no_share_count(self, event: AstrMessageEvent | None) -> None:
         self.no_share_counts.pop(self._event_key(event), None)
 
@@ -337,10 +388,7 @@ class GossipSharer(Star):
         if target_type == "FriendMessage":
             if not sister_id and not self.enable_arbitrary_friend_targets:
                 return f"发送失败：未配置 {sister_key}，无法校验默认私聊目标。"
-            if (
-                not self.enable_arbitrary_friend_targets
-                and str(target_id) != sister_id
-            ):
+            if not self.enable_arbitrary_friend_targets and str(target_id) != sister_id:
                 return (
                     "发送失败：当前未开启任意私聊目标，"
                     f"仅允许发送给配置的 {sister_key}。"
@@ -528,9 +576,7 @@ class GossipSharer(Star):
             if not isinstance(data, dict):
                 data = {}
             if seg_type in {"forward", "forward_msg"}:
-                forward_id = str(
-                    data.get("id") or data.get("message_id") or ""
-                ).strip()
+                forward_id = str(data.get("id") or data.get("message_id") or "").strip()
                 if forward_id:
                     ids.append(forward_id)
         return list(dict.fromkeys(ids))
@@ -565,9 +611,7 @@ class GossipSharer(Star):
             pass
 
         message_id = self._event_message_id(event)
-        sender_id = str(
-            getattr(event, "get_sender_id", lambda: "")() or ""
-        ).strip()
+        sender_id = str(getattr(event, "get_sender_id", lambda: "")() or "").strip()
         sender_name = str(
             getattr(event, "get_sender_name", lambda: "")() or sender_id
         ).strip()
@@ -749,8 +793,7 @@ class GossipSharer(Star):
         expired = [
             key
             for key, payload in self._captured_forward_sources.items()
-            if now - float(payload.get("updated_at") or 0)
-            > FORWARD_CAPTURE_TTL_SECONDS
+            if now - float(payload.get("updated_at") or 0) > FORWARD_CAPTURE_TTL_SECONDS
         ]
         for key in expired:
             self._captured_forward_sources.pop(key, None)
@@ -765,9 +808,7 @@ class GossipSharer(Star):
         payload = self._captured_forward_sources.setdefault(
             event_key, {"updated_at": time.monotonic(), "entries": []}
         )
-        identities = {
-            self._capture_entry_identity(item) for item in payload["entries"]
-        }
+        identities = {self._capture_entry_identity(item) for item in payload["entries"]}
         for entry in entries:
             identity = self._capture_entry_identity(entry)
             if identity in identities:
@@ -798,9 +839,7 @@ class GossipSharer(Star):
         cached_payload = self._captured_forward_sources.pop(event_key, {})
         entries = list(cached_payload.get("entries") or [])
         try:
-            entries.extend(
-                event.get_extra(CAPTURED_FORWARD_SOURCES_EXTRA, []) or []
-            )
+            entries.extend(event.get_extra(CAPTURED_FORWARD_SOURCES_EXTRA, []) or [])
         except Exception:
             pass
         entries.extend(self._build_capture_entries(event))
@@ -897,9 +936,7 @@ class GossipSharer(Star):
             )
         return "\n".join(lines)
 
-    def _find_forward_entry(
-        self, registry: dict[str, dict], ref: str
-    ) -> dict | None:
+    def _find_forward_entry(self, registry: dict[str, dict], ref: str) -> dict | None:
         direct = registry.get(ref)
         if direct:
             return direct
@@ -966,9 +1003,7 @@ class GossipSharer(Star):
                     self._normalize_onebot_content(data.get("content") or [])
                 )
                 if content:
-                    sender_id = str(
-                        data.get("user_id") or data.get("uin") or "0"
-                    )
+                    sender_id = str(data.get("user_id") or data.get("uin") or "0")
                     sender_name = str(
                         data.get("nickname")
                         or data.get("name")
@@ -1067,9 +1102,7 @@ class GossipSharer(Star):
             elif seg_type == "video":
                 parts.append(("[视频]", True))
             elif seg_type == "at":
-                parts.append(
-                    (f"@{data.get('name') or data.get('qq') or '成员'}", True)
-                )
+                parts.append((f"@{data.get('name') or data.get('qq') or '成员'}", True))
             elif seg_type in {"face", "mface"}:
                 parts.append(("[表情]", True))
             elif seg_type == "reply":
@@ -1105,7 +1138,11 @@ class GossipSharer(Star):
         preview = ""
         previous_separated = False
         for value, separated in parts:
-            if preview and (previous_separated or separated) and not preview.endswith(" "):
+            if (
+                preview
+                and (previous_separated or separated)
+                and not preview.endswith(" ")
+            ):
                 preview += " "
             preview += value
             previous_separated = separated
@@ -1138,18 +1175,12 @@ class GossipSharer(Star):
             data = node.get("data") if isinstance(node, dict) else None
             if not isinstance(data, dict):
                 continue
-            sender_name = str(
-                data.get("nickname") or data.get("name") or ""
-            ).strip()
+            sender_name = str(data.get("nickname") or data.get("name") or "").strip()
             if sender_name and sender_name not in sender_names:
                 sender_names.append(sender_name)
             if len(sender_names) >= 4:
                 break
-        return (
-            "和".join(sender_names) + "的聊天记录"
-            if sender_names
-            else "聊天记录"
-        )
+        return "和".join(sender_names) + "的聊天记录" if sender_names else "聊天记录"
 
     def _forward_card_news(
         self,
@@ -1157,9 +1188,7 @@ class GossipSharer(Star):
         fallback_nodes: list[dict],
         limit: int = 4,
     ) -> list[dict]:
-        nodes = self._forward_card_nodes_for_metadata(
-            primary_nodes, fallback_nodes
-        )
+        nodes = self._forward_card_nodes_for_metadata(primary_nodes, fallback_nodes)
         news = []
         for node in nodes:
             data = node.get("data") if isinstance(node, dict) else None
@@ -1317,12 +1346,22 @@ class GossipSharer(Star):
             if item.get("kind") == "image"
             for alias in item.get("aliases", set())
         }
-        represented_image_count = counters["image"]
-        for index, image_ref in enumerate(provider_image_refs or []):
-            if index < represented_image_count:
-                continue
+        represented_images = [
+            item for item in registry.values() if item.get("kind") == "image"
+        ]
+        represented_image_count = len(represented_images)
+        provider_refs = list(provider_image_refs or [])
+        for index, image_ref in enumerate(provider_refs):
             image_ref = str(image_ref or "").strip()
             if not image_ref or image_ref in known_image_aliases:
+                continue
+            if index < represented_image_count:
+                if (
+                    len(provider_refs) == represented_image_count
+                    and len(image_ref) <= 2048
+                ):
+                    represented_images[index]["aliases"].add(image_ref)
+                    known_image_aliases.add(image_ref)
                 continue
             register(Image(file=image_ref), "消息或引用图片")
             known_image_aliases.add(image_ref)
@@ -1332,6 +1371,49 @@ class GossipSharer(Star):
         except Exception:
             pass
         return registry
+
+    def _seed_wake_attachment_registry(
+        self, event: AstrMessageEvent, prepared: dict
+    ) -> None:
+        """Expose original task attachments instead of lossy LLM preview copies.
+
+        Args:
+            event: Synthetic event that will receive the delegated task.
+            prepared: Original images and stable file snapshots prepared for it.
+        """
+
+        registry = {}
+        for index, image in enumerate(prepared.get("images", []), 1):
+            ref_id = f"image_{index}"
+            name = image.get("name") or ref_id
+            registry[ref_id] = {
+                "id": ref_id,
+                "kind": "image",
+                "component": Image.fromBase64(image["base64"]),
+                "source": "委派任务原图",
+                "name": name,
+                "raw_ref": "",
+                "aliases": {ref_id, name},
+                "snapshot_base64": image["base64"],
+                "snapshot_size": image.get("size", 0),
+                "llm_snapshot_base64": image.get("llm_base64"),
+                "llm_snapshot_error": "",
+                "is_gif": image.get("is_gif", False),
+            }
+        for index, file_info in enumerate(prepared.get("files", []), 1):
+            ref_id = f"file_{index}"
+            name = file_info.get("name") or ref_id
+            path = file_info["path"]
+            registry[ref_id] = {
+                "id": ref_id,
+                "kind": "file",
+                "component": File(name=name, file=path),
+                "source": "委派任务文件",
+                "name": name,
+                "raw_ref": path,
+                "aliases": {ref_id, name, path},
+            }
+        event.set_extra(ATTACHMENT_REGISTRY_EXTRA, registry)
 
     def _format_attachment_catalog(self, registry: dict[str, dict]) -> str:
         """Format attachment references for the source LLM.
@@ -1347,8 +1429,9 @@ class GossipSharer(Star):
             return ""
         lines = [
             "[可携带到目标 QQ 会话的附件]",
-            "只有确实需要发送时，才把下面的短引用传给 wake_qq_session_task。",
+            "发送到其他会话用 wake_qq_session_task；发送到当前会话或固定任务回传会话用 reply_qq_session_task。",
             "消息或引用图片必须使用 image_1 这类短引用；不要复用历史中的 /data/temp/media_image_* 临时路径。",
+            "需要以前的原图或文件时，用 get_qq_session_messages 读取实际 QQ 消息并取得新的短引用；文字描述不等于发送附件。",
         ]
         for ref_id, item in registry.items():
             kind_name = "图片" if item["kind"] == "image" else "文件"
@@ -1464,9 +1547,7 @@ class GossipSharer(Star):
         return None
 
     @staticmethod
-    def _wake_prepare_issue(
-        kind: str, code: str, message: str, ref: str = ""
-    ) -> dict:
+    def _wake_prepare_issue(kind: str, code: str, message: str, ref: str = "") -> dict:
         return {"kind": kind, "ref": ref, "code": code, "message": message}
 
     @staticmethod
@@ -1502,7 +1583,9 @@ class GossipSharer(Star):
                 if any(
                     candidate == ref
                     or Path(
-                        file_uri_to_path(candidate) if is_file_uri(candidate) else candidate
+                        file_uri_to_path(candidate)
+                        if is_file_uri(candidate)
+                        else candidate
                     ).name
                     == basename
                     for candidate in candidates
@@ -1511,9 +1594,7 @@ class GossipSharer(Star):
                     matches.append(item)
             if len(matches) == 1:
                 matched = matches[0]
-                logger.info(
-                    f"历史临时图片引用 {ref} 已精确映射到本轮 {matched['id']}"
-                )
+                logger.info(f"历史临时图片引用 {ref} 已精确映射到本轮 {matched['id']}")
                 return str(matched["id"]), matched
             if len(matches) > 1:
                 raise ValueError("临时图片引用在当前消息中存在多个匹配，拒绝猜测")
@@ -1562,7 +1643,9 @@ class GossipSharer(Star):
         )
         if normalized_images and not self.enable_wake_images:
             fatal_failures.append(
-                self._wake_prepare_issue("图片", "disabled", "图片发送功能已在配置中关闭")
+                self._wake_prepare_issue(
+                    "图片", "disabled", "图片发送功能已在配置中关闭"
+                )
             )
             normalized_images = []
         if len(normalized_images) > self.max_wake_images:
@@ -1649,7 +1732,9 @@ class GossipSharer(Star):
         )
         if normalized_files and not self.enable_wake_files:
             fatal_failures.append(
-                self._wake_prepare_issue("文件", "disabled", "文件发送功能已在配置中关闭")
+                self._wake_prepare_issue(
+                    "文件", "disabled", "文件发送功能已在配置中关闭"
+                )
             )
             normalized_files = []
         if len(normalized_files) > self.max_wake_files:
@@ -1665,17 +1750,39 @@ class GossipSharer(Star):
         for ref in normalized_files:
             downloaded = False
             path: Path | None = None
+            file_bytes: bytes | None = None
             try:
                 entry = self._find_attachment_entry(registry, ref, "file")
                 if entry:
                     component = entry["component"]
                     name = entry["name"]
-                    had_local_file = bool(getattr(component, "file_", None))
+                    local_ref = str(getattr(component, "file_", None) or "")
+                    had_local_file = (
+                        bool(local_ref)
+                        and Path(
+                            file_uri_to_path(local_ref)
+                            if is_file_uri(local_ref)
+                            else local_ref
+                        ).is_file()
+                    )
                     file_path = await component.get_file()
                     downloaded = (
                         bool(getattr(component, "url", None)) and not had_local_file
                     )
                     path = self._validate_attachment_path(file_path, trusted=True)
+                elif image_entry := self._find_attachment_entry(registry, ref, "image"):
+                    # A selected original image may also be delivered as a QQ file.
+                    entry = image_entry
+                    encoded = (
+                        image_entry.get("snapshot_base64")
+                        or await image_entry["component"].convert_to_base64()
+                    )
+                    file_bytes = base64.b64decode(encoded, validate=True)
+                    name = image_entry["name"]
+                    if not Path(name).suffix:
+                        with PILImage.open(io.BytesIO(file_bytes)) as image_file:
+                            extension = str(image_file.format or "png").lower()
+                        name = f"{name}.{extension}"
                 elif ref.startswith(("http://", "https://")):
                     if not self.allow_remote_attachment_urls:
                         raise ValueError("配置禁止直接使用远程附件 URL")
@@ -1689,7 +1796,9 @@ class GossipSharer(Star):
                     path = self._validate_attachment_path(ref)
                     name = path.name
 
-                size = path.stat().st_size
+                size = (
+                    len(file_bytes) if file_bytes is not None else path.stat().st_size
+                )
                 if size > self.max_wake_file_mb * 1024 * 1024:
                     raise ValueError(f"超过单个文件 {self.max_wake_file_mb} MB 限制")
                 if total_bytes + size > total_limit:
@@ -1702,7 +1811,10 @@ class GossipSharer(Star):
                 if not re.fullmatch(r"\.[A-Za-z0-9]{1,16}", suffix):
                     suffix = ""
                 snapshot_path = snapshot_dir / f"{uuid.uuid4().hex}{suffix}"
-                shutil.copy2(path, snapshot_path)
+                if file_bytes is not None:
+                    snapshot_path.write_bytes(file_bytes)
+                else:
+                    shutil.copy2(path, snapshot_path)
                 files.append(
                     {
                         "ref": ref,
@@ -1824,17 +1936,25 @@ class GossipSharer(Star):
             )
             raw_nodes = self._extract_forward_raw_nodes(payload)
             if not raw_nodes:
-                return [], [], "", [
-                    f"{entry.get('id') or forward_id}: 获取合并聊天记录内容失败或记录已过期"
-                ]
+                return (
+                    [],
+                    [],
+                    "",
+                    [
+                        f"{entry.get('id') or forward_id}: 获取合并聊天记录内容失败或记录已过期"
+                    ],
+                )
         elif nodes_component is not None:
             try:
                 payload = await nodes_component.to_dict()
                 raw_nodes = self._extract_forward_raw_nodes(payload)
             except Exception as e:
-                return [], [], "", [
-                    f"{entry.get('id') or '合并记录'}: 转换内联记录失败：{e}"
-                ]
+                return (
+                    [],
+                    [],
+                    "",
+                    [f"{entry.get('id') or '合并记录'}: 转换内联记录失败：{e}"],
+                )
         elif entry.get("kind") == "message":
             message_id = str(entry.get("message_id") or "").strip()
             raw_segments = entry.get("raw_segments") or []
@@ -1878,9 +1998,7 @@ class GossipSharer(Star):
                 or ""
             ).strip()
             if source_platform == target_platform and message_id:
-                primary_nodes.append(
-                    {"type": "node", "data": {"id": message_id}}
-                )
+                primary_nodes.append({"type": "node", "data": {"id": message_id}})
             elif custom_node:
                 primary_nodes.append(custom_node)
             if custom_node:
@@ -1947,9 +2065,6 @@ class GossipSharer(Star):
         source_is_group = bool(self._source_group_id(event))
         force_group_source = False
         has_constructed_nodes = False
-        base_forward_time = int(
-            self._normalize_forward_time(self._event_timestamp(event), time.time())
-        )
 
         async def append_registry_ref(ref: str) -> dict | None:
             nonlocal force_group_source, has_constructed_nodes
@@ -2043,9 +2158,7 @@ class GossipSharer(Star):
         return {
             "forwards": forwards,
             "fatal_failures": [
-                self._wake_prepare_issue(
-                    "合并记录", "prepare_failed", failure
-                )
+                self._wake_prepare_issue("合并记录", "prepare_failed", failure)
                 for failure in failures
             ],
             "warnings": [],
@@ -2079,6 +2192,8 @@ class GossipSharer(Star):
         if not callable(caller):
             caller = getattr(getattr(bot, "api", None), "call_action", None)
         if not callable(caller):
+            for package in forwards:
+                package["delivery_error"] = "平台不支持合并记录发送"
             return False
 
         action = (
@@ -2089,6 +2204,9 @@ class GossipSharer(Star):
         target_key = "group_id" if target_type == "GroupMessage" else "user_id"
         target_value = int(target_id) if str(target_id).isdigit() else target_id
         for package in forwards:
+            if package.get("delivered"):
+                continue
+
             def build_action_kwargs(nodes: list[dict]) -> dict:
                 kwargs = {target_key: target_value, "messages": nodes}
                 for key in ("source", "news", "summary", "prompt"):
@@ -2103,6 +2221,8 @@ class GossipSharer(Star):
                     **build_action_kwargs(package["nodes"]),
                 )
                 if self._onebot_action_succeeded(result):
+                    package["delivered"] = True
+                    package.pop("delivery_error", None)
                     continue
                 raise RuntimeError(f"平台返回失败结果: {result}")
             except Exception as primary_error:
@@ -2112,14 +2232,14 @@ class GossipSharer(Star):
                     or len(fallback_nodes) != len(package.get("nodes") or [])
                     or fallback_nodes == package.get("nodes")
                 ):
+                    package["delivery_error"] = str(primary_error)
                     logger.warning(
-                        f"目标 QQ 合并记录投递失败: {primary_error}",
+                        "Failed to send QQ merged record: %s",
+                        primary_error,
                         exc_info=True,
                     )
                     return False
-                logger.info(
-                    "按原消息 ID 投递合并记录失败，改用已保存的自定义节点重试"
-                )
+                logger.info("按原消息 ID 投递合并记录失败，改用已保存的自定义节点重试")
                 try:
                     result = await caller(
                         action,
@@ -2127,10 +2247,12 @@ class GossipSharer(Star):
                     )
                     if not self._onebot_action_succeeded(result):
                         raise RuntimeError(f"平台返回失败结果: {result}")
+                    package["delivered"] = True
+                    package.pop("delivery_error", None)
                 except Exception as fallback_error:
+                    package["delivery_error"] = str(fallback_error)
                     logger.warning(
-                        "目标 QQ 合并记录自定义节点降级投递失败: "
-                        f"{fallback_error}",
+                        f"目标 QQ 合并记录自定义节点降级投递失败: {fallback_error}",
                         exc_info=True,
                     )
                     return False
@@ -2147,26 +2269,56 @@ class GossipSharer(Star):
             prepared: Result returned by ``_prepare_wake_attachments``.
 
         Returns:
-            Whether the platform accepted the attachment message chain.
+            Whether all selected attachment send calls completed successfully.
         """
 
-        chain = MessageChain()
-        for image in prepared.get("images", []):
-            if image.get("standalone", True):
-                chain.base64_image(image["base64"])
-        for file_info in prepared.get("files", []):
-            if file_info.get("standalone", True):
-                chain.chain.append(
-                    File(name=file_info["name"], file=file_info["path"])
-                )
-        if not chain.chain:
-            return True
-        if self._event_kind(event) == "official":
-            # 官方适配器的 send_by_session 依赖它自己缓存的 msg_id，重启后没见过的群会被跳过；
-            # 走合成事件自身的回复链路，可复用被动回复并在失败时自动降级为主动推送。
-            await event.send(chain)
-            return True
-        return bool(await self.context.send_message(session_id, chain))
+        all_sent = True
+        for kind, items in (
+            ("image", prepared.get("images", [])),
+            ("file", prepared.get("files", [])),
+        ):
+            for item in items:
+                if not item.get("standalone", True) or item.get("delivered"):
+                    continue
+                try:
+                    chain = MessageChain()
+                    if kind == "image":
+                        chain.base64_image(item["base64"])
+                    else:
+                        chain.chain.append(File(name=item["name"], file=item["path"]))
+                    if self._event_kind(event) == "official":
+                        if self._event_key(event) != session_id:
+                            parts = session_id.split(":", 2)
+                            destination_id = str(prepared.get("target_id") or parts[-1])
+                            group_id = str(event.get_group_id() or "")
+                            same_destination = len(parts) == 3 and (
+                                event.get_platform_id() == parts[0]
+                                and (
+                                    parts[1] == "GroupMessage"
+                                    and group_id == destination_id
+                                    or parts[1] == "FriendMessage"
+                                    and not group_id
+                                    and str(event.get_sender_id()) == destination_id
+                                )
+                            )
+                            if not same_destination:
+                                raise ValueError("官方平台附件发送事件与目标会话不一致")
+                        await event.send(chain)
+                    elif not await self.context.send_message(session_id, chain):
+                        raise RuntimeError("未找到目标平台")
+                    item["delivered"] = True
+                    item.pop("delivery_error", None)
+                except Exception as e:
+                    item["delivery_error"] = str(e)
+                    all_sent = False
+                    logger.warning(
+                        "Failed to send %s attachment %s to %s: %s",
+                        kind,
+                        item.get("name"),
+                        session_id,
+                        e,
+                    )
+        return all_sent
 
     async def _send_wake_payloads(
         self, event: AstrMessageEvent, session_id: str, prepared: dict
@@ -2182,9 +2334,7 @@ class GossipSharer(Star):
             target_platform,
             prepared,
         )
-        attachments_ok = await self._send_wake_attachments(
-            event, session_id, prepared
-        )
+        attachments_ok = await self._send_wake_attachments(event, session_id, prepared)
         return forwards_ok and attachments_ok
 
     def _format_wake_attachment_summary(
@@ -2234,13 +2384,25 @@ class GossipSharer(Star):
                     lines.append(f"- 合并记录内文件: {file_info['name']}")
             for forward in forwards:
                 preview = str(forward.get("preview") or "").strip()
-                lines.append(
-                    f"- 合并聊天记录: {forward.get('node_count', 0)} 个节点"
-                )
+                lines.append(f"- 合并聊天记录: {forward.get('node_count', 0)} 个节点")
                 if preview:
                     lines.append(f"  预览: {preview[:600]}")
         for warning in prepared.get("warnings", []):
             lines.append(f"- 内容准备警告: {self._wake_issue_text(warning)}")
+        if delivered is False:
+            for kind, items in (
+                ("图片", images),
+                ("文件", files),
+                ("合并记录", forwards),
+            ):
+                for item in items:
+                    name = item.get("name") or item.get("ref") or kind
+                    if item.get("delivery_error"):
+                        lines.append(
+                            f"- {kind} {name} 发送失败：{item['delivery_error']}"
+                        )
+                    elif item.get("delivered"):
+                        lines.append(f"- {kind} {name} 发送调用成功")
         return "\n".join(lines)
 
     def _cleanup_wake_snapshots(self, prepared: dict) -> None:
@@ -2904,7 +3066,9 @@ class GossipSharer(Star):
             "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为白名单群和本次运行中收到过消息的群；"
             "target_id 填 group_openid）："
         ]
-        records = sorted(records, key=lambda item: item["last_active"], reverse=True)[:50]
+        records = sorted(records, key=lambda item: item["last_active"], reverse=True)[
+            :50
+        ]
         await asyncio.gather(
             *(self._ensure_official_group_name(event.bot, record) for record in records)
         )
@@ -2983,9 +3147,7 @@ class GossipSharer(Star):
         source_session = str(task_payload.get("source_session") or "").strip()
         source_message = str(task_payload.get("source_message") or "").strip()
         task = str(task_payload.get("task") or "").strip()
-        attachment_summary = str(
-            task_payload.get("attachment_summary") or ""
-        ).strip()
+        attachment_summary = str(task_payload.get("attachment_summary") or "").strip()
 
         if self.max_source_message_chars <= 0:
             source_message = ""
@@ -2996,7 +3158,9 @@ class GossipSharer(Star):
 
         lines = [
             "[跨会话行动]",
+            f"当前执行会话: {task_payload.get('target_session', '')}",
             f"来源会话: {source_session}",
+            f"固定回传会话: {task_payload.get('return_session') or source_session}",
             f"请求者: {requester_name}({requester_id})"
             if requester_id
             else f"请求者: {requester_name}",
@@ -3005,7 +3169,20 @@ class GossipSharer(Star):
             lines.extend(["原始消息:", source_message])
         if attachment_summary:
             lines.extend(["附件信息:", attachment_summary])
-        if task_payload.get("has_pending_attachments") or task_payload.get(
+        return_to_source = bool(task_payload.get("return_to_source"))
+        if return_to_source:
+            lines.extend(
+                [
+                    "回传任务规则:",
+                    "当前会话是执行和取材位置，最终收件人是上面固定的回传会话。",
+                    "需要以前的图片或文件时，用 get_qq_session_messages 读取实际 QQ 原消息，取得 image_N/file_N 短引用。",
+                    "完成后必须用 reply_qq_session_task 回传实际文字或选中的原图、文件；该工具已经固定收件地址，无需填写群号或好友号。",
+                    "本次携带的附件仅作为任务资料，不会自动公开到当前会话；若需回传，请明确选择对应短引用。",
+                    "不要在当前会话发布最终结果，不要把图片描述当成原图，不要再次唤醒来源会话代替真实发送。",
+                    "只有回传工具成功才能说发送调用成功；失败或只有任务提交信息时不得声称图片、文件已发送。",
+                ]
+            )
+        elif task_payload.get("has_pending_attachments") or task_payload.get(
             "has_pending_forwards"
         ):
             lines.extend(
@@ -3021,7 +3198,11 @@ class GossipSharer(Star):
                 "行动目标:",
                 task,
                 "请结合当前目标会话的人设、关系和历史自然完成行动。",
-                "直接在当前会话中说话或调用工具，不要复述内部说明，也不要只回复任务已收到。",
+                (
+                    "通过固定回传工具发送结果，不要复述内部说明，也不要只回复任务已收到。"
+                    if return_to_source
+                    else "直接在当前会话中说话或调用工具；要把结果发回来源时用 reply_qq_session_task。不要复述内部说明，也不要只回复任务已收到。"
+                ),
             ]
         )
         return "\n".join(lines)
@@ -3157,6 +3338,17 @@ class GossipSharer(Star):
         )
         target_event.is_wake = True
         target_event.is_at_or_wake_command = True
+        if task_payload.get("return_to_source"):
+            # Keep output buffered until the reply route has been enforced.
+            target_event.set_extra("enable_streaming", False)
+
+            async def route_task_send(message: MessageChain) -> None:
+                # Tools can send media before the agent-completion hook runs.
+                await self._return_task_output(
+                    target_event, message, final=hasattr(message, "result_content_type")
+                )
+
+            target_event.send = route_task_send
         return target_event
 
     async def _safe_wake_qq_session_task(
@@ -3169,6 +3361,7 @@ class GossipSharer(Star):
         image_refs=None,
         file_refs=None,
         forward_refs=None,
+        return_to_source: bool = False,
     ) -> str:
         if not self.enable_target_session_tasks:
             return "唤醒失败：目标会话任务唤醒工具未启用。"
@@ -3213,6 +3406,43 @@ class GossipSharer(Star):
         if not session_id:
             return "唤醒失败：无法构造目标会话。"
 
+        current_session = self._event_key(event)
+        current_parts = current_session.split(":", 2)
+        current_target = str(
+            getattr(event, "get_group_id", lambda: "")()
+            if target_type == "GroupMessage"
+            else event.get_sender_id()
+        )
+        if session_id == current_session or (
+            len(current_parts) == 3
+            and platform_id == current_parts[0]
+            and target_type == current_parts[1]
+            and target_id == current_target
+        ):
+            return (
+                "唤醒失败：当前已经在该会话，不能再次唤醒自身。"
+                "请直接处理；发送原图或文件用 reply_qq_session_task，读取历史用 get_qq_session_messages。"
+            )
+        delegated = self._get_delegated_task_payload(event)
+        try:
+            return_session, return_type, return_id, return_platform = (
+                self._task_return_route(event, validate=False)
+            )
+        except ValueError as e:
+            return f"唤醒失败：{e}"
+        if delegated and session_id == return_session:
+            return (
+                "唤醒失败：该目标就是任务的固定回传会话。"
+                "请用 reply_qq_session_task 直接发送实际结果，不要再次唤醒收件人。"
+            )
+        return_to_source = self._normalize_bool(return_to_source) or bool(
+            delegated.get("return_to_source")
+        )
+        if return_to_source:
+            error = self._validate_target(return_type, return_id, return_platform)
+            if error:
+                return f"唤醒失败：回传目标不可用：{error.removeprefix('发送失败：')}"
+
         platform = self._get_platform_by_id(platform_id)
         if platform is None:
             return f"唤醒失败：未找到目标平台 {platform_id}。"
@@ -3229,9 +3459,9 @@ class GossipSharer(Star):
         if kind == "official" and self._normalize_attachment_refs(forward_refs):
             return "唤醒失败：QQ 官方机器人不支持合并聊天记录，请去掉 forward_refs 后重试。"
 
-        # 同一请求者在短时间内对同一目标提交相同任务时，只允许首次投递。
-        # 签名有意不包含附件/转发参数，避免模型换一种参数写法绕过去重。
-        wake_signature = f"{requester_id}|{session_id}|{task}"
+        # Attachment spelling cannot bypass deduplication; the reply route can differ.
+        reply_key = return_session if return_to_source else ""
+        wake_signature = f"{requester_id}|{session_id}|{reply_key}|{task}"
         reservation = await self._reserve_wake_signature(wake_signature)
         if reservation != "reserved":
             logger.info(
@@ -3269,14 +3499,11 @@ class GossipSharer(Star):
             return f"唤醒失败：内容准备失败，目标会话未提交：{e}"
 
         prepared["forwards"] = forward_prepared.get("forwards", [])
-        prepared["fatal_failures"].extend(
-            forward_prepared.get("fatal_failures", [])
-        )
+        prepared["fatal_failures"].extend(forward_prepared.get("fatal_failures", []))
         prepared["warnings"].extend(forward_prepared.get("warnings", []))
         if prepared["fatal_failures"]:
             failure_text = "；".join(
-                self._wake_issue_text(issue)
-                for issue in prepared["fatal_failures"]
+                self._wake_issue_text(issue) for issue in prepared["fatal_failures"]
             )
             self._cleanup_wake_snapshots(prepared)
             await self._release_wake_signature(wake_signature)
@@ -3289,6 +3516,11 @@ class GossipSharer(Star):
         attachment_summary = self._format_wake_attachment_summary(
             prepared, delivered=None
         )
+        if return_to_source and attachment_summary:
+            attachment_summary = attachment_summary.replace(
+                "将在本次回复发送完成后投递到目标会话",
+                "仅提供给目标任务使用；是否回传由 reply_qq_session_task 明确选择",
+            )
         task_payload = {
             "target_session": session_id,
             "target_type": target_type,
@@ -3300,6 +3532,11 @@ class GossipSharer(Star):
             "source_session": self._event_key(event),
             "source_platform": getattr(event, "get_platform_id", lambda: "")(),
             "source_message": getattr(event, "get_message_str", lambda: "")(),
+            "return_session": return_session,
+            "return_target_type": return_type,
+            "return_target_id": return_id,
+            "return_platform": return_platform,
+            "return_to_source": return_to_source,
             "attachment_summary": attachment_summary,
             "has_pending_attachments": bool(prepared["images"] or prepared["files"]),
             "has_pending_forwards": bool(prepared["forwards"]),
@@ -3317,9 +3554,10 @@ class GossipSharer(Star):
                 ],
             )
             target_event.set_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, prepared)
+            self._seed_wake_attachment_registry(target_event, prepared)
             delivery = (
                 self._track_official_delivery(target_event)
-                if kind == "official"
+                if kind == "official" and not return_to_source
                 else None
             )
             platform.commit_event(target_event)
@@ -3335,7 +3573,9 @@ class GossipSharer(Star):
             f"requester={requester_id}, task={task}, "
             f"forward_nodes={sum(item.get('node_count', 0) for item in prepared['forwards'])}"
         )
-        result = f"{session_id} <- {task}"
+        result = f"任务已提交：{session_id} <- {task}。等待目标执行，尚未确认内容发送。"
+        if return_to_source:
+            result += f"\n结果固定回传至：{return_session}。"
         if attachment_summary:
             result += f"\n{attachment_summary}"
         if delivery is not None:
@@ -3351,10 +3591,321 @@ class GossipSharer(Star):
         self._reset_no_share_count(event)
         return result
 
+    @filter.llm_tool("reply_qq_session_task")
+    async def reply_qq_session_task(
+        self,
+        event: AstrMessageEvent,
+        content: str = "",
+        image_refs: list[str] = None,
+        file_refs: list[str] = None,
+        forward_refs: list[str] = None,
+    ) -> str:
+        """Send actual task results to the fixed original conversation.
+
+        Use this tool to return a delegated task's result, rather than waking its
+        requester again. In an ordinary conversation it sends to that current
+        conversation, so history attachments can be fetched and sent directly.
+        The recipient is fixed by the host; do not guess a group or friend ID.
+        Include actual attachment references when sending images or files. Text
+        descriptions do not send the attachments. Repeating the same selection
+        retries only attachments whose send calls have not succeeded.
+
+        Args:
+            content (str): Optional result text, sent after the selected attachments.
+            image_refs (list[string]): Original image references from the attachment catalog or
+                get_qq_session_messages. Use image_N; never guess old temp paths.
+            file_refs (list[string]): File references or allowed local files. An image_N reference
+                is also accepted here to deliver the original image as a QQ file.
+            forward_refs (list[string]): Existing forward_N or message_N references to return
+                as an expandable OneBot merged record.
+
+        Returns:
+            Send-call results for the fixed destination, or an explicit failure.
+        """
+
+        event = self._unwrap_message_event(event)
+        if event is None or not self._event_kind(event):
+            return "回传失败：无法识别当前 QQ 会话。"
+        content = str(content or "").strip()
+        image_refs = self._normalize_attachment_refs(image_refs)
+        file_refs = self._normalize_attachment_refs(file_refs)
+        forward_refs = self._normalize_attachment_refs(forward_refs)
+        if not (content or image_refs or file_refs or forward_refs):
+            return "回传失败：没有选择实际文字、图片、文件或合并记录。"
+        try:
+            session_id, target_type, target_id, platform_id = self._task_return_route(
+                event
+            )
+        except ValueError as e:
+            return f"回传失败：{e}"
+        if self._event_kind(event) == "official" and forward_refs:
+            return "回传失败：QQ 官方机器人不支持合并聊天记录。"
+        if event.get_extra(TASK_RESULT_SENDING_EXTRA, False):
+            return "结果正在发送，请等待本次调用完成，不要重复发送。"
+
+        request_key = json.dumps(
+            [session_id, content, image_refs, file_refs, forward_refs],
+            ensure_ascii=False,
+        )
+        previous = event.get_extra(TASK_RESULT_EXTRA, {})
+        if not isinstance(previous, dict) or previous.get("request_key") != request_key:
+            previous = {}
+        if previous.get("complete"):
+            return previous["message"]
+
+        event.set_extra(TASK_RESULT_SENDING_EXTRA, True)
+        prepared = None
+        state = {
+            "request_key": request_key,
+            "session_id": session_id,
+            "complete": False,
+        }
+        event.set_extra(TASK_RESULT_EXTRA, state)
+        try:
+            prepared = await self._prepare_wake_attachments(
+                event, image_refs, file_refs
+            )
+            forward_prepared = await self._prepare_wake_forwards(
+                event, platform_id, forward_refs, prepared
+            )
+            prepared["forwards"] = forward_prepared.get("forwards", [])
+            prepared["fatal_failures"].extend(
+                forward_prepared.get("fatal_failures", [])
+            )
+            prepared["warnings"].extend(forward_prepared.get("warnings", []))
+            if prepared["fatal_failures"]:
+                failures = "；".join(
+                    self._wake_issue_text(issue) for issue in prepared["fatal_failures"]
+                )
+                state["message"] = f"回传失败：内容准备失败，本次未发送：{failures}"
+                return state["message"]
+            prepared.update(
+                target_type=target_type,
+                target_id=target_id,
+                target_platform=platform_id,
+            )
+            old_prepared = previous.get("prepared", {})
+            for kind in ("images", "files", "forwards"):
+                for index, item in enumerate(prepared.get(kind, [])):
+                    old_items = old_prepared.get(kind, [])
+                    if index < len(old_items) and old_items[index].get("delivered"):
+                        item["delivered"] = True
+            state["prepared"] = prepared
+
+            delivery_event = event
+            if (
+                self._event_kind(event) == "official"
+                and self._event_key(event) != session_id
+            ):
+                requester_id, requester_name = self._get_effective_requester(event)
+                delivery_event = await self._build_qq_task_wake_event(
+                    self._get_platform_by_id(platform_id),
+                    {
+                        "target_session": session_id,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "target_platform": platform_id,
+                        "source_session": self._event_key(event),
+                        "requester_id": requester_id,
+                        "requester_name": requester_name,
+                        "task": content or "发送所选附件",
+                    },
+                )
+            if not await self._send_wake_payloads(delivery_event, session_id, prepared):
+                state["message"] = (
+                    "回传失败：部分或全部内容未能发送；已成功的附件不会重复发送。\n"
+                    + self._format_wake_attachment_summary(prepared, delivered=False)
+                )
+                return state["message"]
+            if content and not previous.get("content_sent"):
+                chain = MessageChain().message(content)
+                if self._event_kind(delivery_event) == "official":
+                    await delivery_event.send(chain)
+                elif not await self.context.send_message(session_id, chain):
+                    raise RuntimeError("未找到回传目标平台")
+            state["content_sent"] = bool(content)
+            counts = [
+                sum(item.get("standalone", True) for item in prepared.get(kind, []))
+                for kind in ("images", "files")
+            ]
+            state["message"] = (
+                f"结果发送调用成功：{session_id}；图片 {counts[0]}，文件 {counts[1]}，"
+                f"合并记录 {len(prepared['forwards'])}。"
+                "这是实际发送调用的结果，不代表对方已阅读。"
+            )
+            state["complete"] = True
+            self._reset_no_share_count(event)
+            if session_id != self._event_key(event):
+                try:
+                    history_text = content
+                    if any(counts) or prepared["forwards"]:
+                        history_text += (
+                            f"\n[已发送附件：图片 {counts[0]}，文件 {counts[1]}，"
+                            f"合并记录 {len(prepared['forwards'])}]"
+                        )
+                    await self._persist_cross_context(event, session_id, history_text)
+                except Exception as e:
+                    logger.warning(
+                        "Result sent, but reply history could not be saved: %s", e
+                    )
+            return state["message"]
+        except Exception as e:
+            details = (
+                self._format_wake_attachment_summary(prepared, delivered=False)
+                if prepared
+                else ""
+            )
+            state["message"] = f"回传失败：{e}" + (f"\n{details}" if details else "")
+            logger.warning("Failed to return QQ task result to %s: %s", session_id, e)
+            return state["message"]
+        finally:
+            event.set_extra(TASK_RESULT_SENDING_EXTRA, False)
+            if isinstance(prepared, dict):
+                self._cleanup_wake_snapshots(prepared)
+
+    async def _return_task_output(
+        self, event: AstrMessageEvent, message: MessageChain, *, final: bool = False
+    ) -> None:
+        """Route task output, including direct tool media, to its original session.
+
+        Args:
+            event: Return-mode task event whose visible output is being handled.
+            message: Result text and original media produced by the target agent.
+            final: Whether this is the final reply after any direct tool outputs.
+        """
+
+        message_type = getattr(message, "type", "")
+        if message_type in {"tool_call", "reasoning", "agent_stats"}:
+            return
+        components = list(getattr(message, "chain", []) or [])
+        has_media = any(isinstance(component, Image | File) for component in components)
+        if not final and not has_media and message_type != "tool_direct_result":
+            return
+        previous = event.get_extra(TASK_RESULT_EXTRA, {})
+        if (
+            final
+            and not has_media
+            and isinstance(previous, dict)
+            and previous.get("complete")
+        ):
+            return
+        registry = self._ensure_attachment_registry(event)
+        texts = []
+        image_refs = []
+        file_refs = []
+        for component in components:
+            if isinstance(component, Plain):
+                texts.append(component.text)
+                continue
+            if not isinstance(component, Image | File):
+                # Group-specific At and Reply components do not belong in the reply.
+                continue
+            kind = "image" if isinstance(component, Image) else "file"
+            if kind == "image":
+                raw_value = (
+                    getattr(component, "path", None)
+                    or getattr(component, "url", None)
+                    or getattr(component, "file", None)
+                )
+            else:
+                raw_value = getattr(component, "file_", None) or getattr(
+                    component, "url", None
+                )
+            raw_ref = str(raw_value or "").strip()
+            entry = next(
+                (
+                    item
+                    for item in registry.values()
+                    if item.get("kind") == kind
+                    and (
+                        item.get("component") is component
+                        or (raw_ref and item.get("raw_ref") == raw_ref)
+                        or (
+                            kind == "image"
+                            and raw_ref.startswith("base64://")
+                            and item.get("snapshot_base64")
+                            == raw_ref.removeprefix("base64://")
+                        )
+                    )
+                ),
+                None,
+            )
+            if entry is None and raw_ref and len(raw_ref) <= 2048:
+                entry = self._find_attachment_entry(registry, raw_ref, kind)
+            if entry is None:
+                number = (
+                    max(
+                        (
+                            int(ref.rsplit("_", 1)[-1])
+                            for ref in registry
+                            if re.fullmatch(rf"{kind}_\d+", ref)
+                        ),
+                        default=0,
+                    )
+                    + 1
+                )
+                ref_id = f"{kind}_{number}"
+                name = str(getattr(component, "name", None) or "").strip()
+                if (
+                    not name
+                    and raw_ref
+                    and not raw_ref.startswith(("base64://", "data:"))
+                ):
+                    name = Path(urlparse(raw_ref).path).name
+                name = name or ref_id
+                aliases = {ref_id, name}
+                if raw_ref and len(raw_ref) <= 2048:
+                    aliases.add(raw_ref)
+                entry = {
+                    "id": ref_id,
+                    "kind": kind,
+                    "component": component,
+                    "source": "目标任务实际输出",
+                    "name": name,
+                    "raw_ref": raw_ref,
+                    "aliases": aliases,
+                }
+                registry[ref_id] = entry
+            (image_refs if kind == "image" else file_refs).append(entry["id"])
+        event.set_extra(ATTACHMENT_REGISTRY_EXTRA, registry)
+        content = "".join(texts).strip()
+        if final and isinstance(previous, dict) and previous.get("complete"):
+            old_prepared = previous.get("prepared", {})
+            old_images = {item.get("ref") for item in old_prepared.get("images", [])}
+            old_files = {item.get("ref") for item in old_prepared.get("files", [])}
+            image_refs = [ref for ref in image_refs if ref not in old_images]
+            file_refs = [ref for ref in file_refs if ref not in old_files]
+            if not (image_refs or file_refs):
+                return
+        if final and not (image_refs or file_refs):
+            if isinstance(previous, dict) and previous.get("message", "").startswith(
+                "回传失败："
+            ):
+                content = previous["message"]
+            elif content:
+                content += "\n本次只回传了文字，没有发送图片或文件。"
+            else:
+                content = (
+                    "目标会话处理已结束，但没有回传实际结果，也没有发送图片或文件。"
+                )
+        if not (content or image_refs or file_refs):
+            return
+        result = await self.reply_qq_session_task(
+            event, content=content, image_refs=image_refs, file_refs=file_refs
+        )
+        if result.startswith("回传失败："):
+            logger.warning(
+                "Could not route task output to its original session: %s", result
+            )
+
     async def _deliver_pending_wake_payloads(
         self, event: AstrMessageEvent, *, empty_reply: bool
     ) -> None:
         prepared = event.get_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, None)
+        if self._get_delegated_task_payload(event).get("return_to_source"):
+            if isinstance(prepared, dict):
+                self._cleanup_wake_snapshots(prepared)
+            return
         if not isinstance(prepared, dict) or event.get_extra(
             WAKE_ATTACHMENTS_ATTEMPTED_EXTRA, False
         ):
@@ -3414,6 +3965,24 @@ class GossipSharer(Star):
             or getattr(response, "role", "") != "assistant"
         ):
             return
+        if self._get_delegated_task_payload(event).get("return_to_source"):
+            result_chain = getattr(response, "result_chain", None)
+            if not result_chain or not getattr(result_chain, "chain", None):
+                result_chain = MessageChain().message(
+                    str(getattr(response, "completion_text", "") or "")
+                )
+            # Suppress the work-session reply before any downstream output stage.
+            response.completion_text = ""
+            response.result_chain = MessageChain()
+            response.reasoning_content = ""
+            event.set_extra("_llm_reasoning_content", "")
+            try:
+                await self._return_task_output(event, result_chain, final=True)
+            finally:
+                prepared = event.get_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, None)
+                if isinstance(prepared, dict):
+                    self._cleanup_wake_snapshots(prepared)
+            return
         prepared = event.get_extra(PENDING_WAKE_ATTACHMENTS_EXTRA, None)
         if not isinstance(prepared, dict) or event.get_extra(
             WAKE_ATTACHMENTS_SENT_EXTRA, False
@@ -3444,6 +4013,434 @@ class GossipSharer(Star):
             return
 
         await self._deliver_pending_wake_payloads(event, empty_reply=False)
+
+    @filter.llm_tool("get_qq_session_messages")
+    async def get_qq_session_messages(
+        self,
+        event: AstrMessageEvent,
+        target_id: str = "",
+        target_type: str = "",
+        target_platform: str = None,
+        limit: int = 20,
+        before_message_id: str = "",
+    ) -> str:
+        """Read real QQ messages and obtain original image and file references.
+
+        Use this tool to recover an original attachment mentioned in conversation
+        history instead of reusing an expired media_image temporary path. Returned
+        image_N and file_N references can be passed to reply_qq_session_task or
+        wake_qq_session_task. The current session is used when no target is given.
+        Match the requested subject using message text, sender and time clues. If
+        it is older than the returned window, use the oldest returned message ID
+        as before_message_id to read further back. Never substitute an unrelated
+        recent picture just because the first page did not contain the original.
+
+        Args:
+            target_id(string): Optional QQ group or friend ID to read.
+            target_type(string): Optional GroupMessage or FriendMessage. Defaults
+                to the actual current session type; specify it when switching type.
+            target_platform(string): Optional platform ID. Defaults to the actual
+                current event platform, independently of default_platform.
+            limit(number): Number of real messages to return, clamped to 1..50.
+            before_message_id(string): Optional real message ID anchor. Reads that
+                exact message and earlier messages, never unrelated newer images.
+
+        Returns:
+            Real message IDs, senders, times, text and reusable attachment refs,
+            or an explicit explanation when the platform cannot read them.
+        """
+        from datetime import datetime, timezone
+
+        event = self._unwrap_message_event(event)
+        if event is None:
+            return "读取失败：无法识别当前来源事件。"
+        if self._event_kind(event) != "onebot":
+            return "读取失败：只有 QQ OneBot 平台提供原始消息历史接口；QQ 官方机器人不支持此工具。"
+
+        try:
+            origin = str(getattr(event, "unified_msg_origin", "") or "")
+            origin_parts = origin.split(":", 2)
+            source_platform = str(event.get_platform_id() or "").strip()
+            source_group = str(event.get_group_id() or "").strip()
+            source_type = "GroupMessage" if source_group else "FriendMessage"
+            source_id = source_group or str(event.get_sender_id() or "").strip()
+            if len(origin_parts) == 3:
+                source_platform = source_platform or origin_parts[0]
+                if not source_group and origin_parts[1] == "GroupMessage":
+                    source_type = "GroupMessage"
+                    source_id = origin_parts[2].rsplit("_", 1)[-1]
+                elif not source_id:
+                    source_id = origin_parts[2]
+            explicit_target = bool(target_id or target_type or target_platform)
+            platform_id = str(target_platform or source_platform).strip()
+            resolved_type = self._normalize_target_type_name(target_type, source_type)
+            if resolved_type not in {"GroupMessage", "FriendMessage"}:
+                return "读取失败：target_type 只允许 GroupMessage 或 FriendMessage。"
+            if not target_id and resolved_type != source_type:
+                return "读取失败：切换群聊或私聊类型时必须明确指定 target_id。"
+            resolved_id = str(target_id or source_id).strip()
+            if not re.fullmatch(r"\d+", resolved_id):
+                return "读取失败：无法识别有效的 QQ 群号或好友 QQ。"
+            platform = self._get_platform_by_id(platform_id)
+            if self._platform_kind(platform) != "onebot":
+                return "读取失败：目标平台必须与来源同为 QQ OneBot 适配器。"
+            if explicit_target:
+                error = self._validate_target(resolved_type, resolved_id, platform_id)
+                if error:
+                    return error.replace("发送失败：", "读取失败：", 1)
+            limit = max(1, min(int(limit), 50))
+        except (TypeError, ValueError) as error:
+            return f"读取失败：目标或 limit 参数无效：{error}"
+
+        session_id = self._build_session_id(resolved_type, resolved_id, platform_id)
+        is_group = resolved_type == "GroupMessage"
+        self_id = str(getattr(getattr(event, "message_obj", None), "self_id", "") or "")
+        routing = {"self_id": self_id} if self_id else {}
+        anchor_id = str(before_message_id or "").strip()
+        anchor = None
+        anchor_time = 0.0
+        warnings = []
+        params = {
+            "group_id" if is_group else "user_id": int(resolved_id),
+            "count": limit,
+        }
+        if anchor_id:
+            if not re.fullmatch(r"-?\d+", anchor_id):
+                return "读取失败：before_message_id 必须是平台返回的真实数字消息 ID。"
+            anchor = await self._call_platform_action(
+                platform_id, "get_msg", message_id=int(anchor_id), **routing
+            )
+            anchor = self._unwrap_onebot_action_payload(anchor)
+            if (
+                not isinstance(anchor, dict)
+                or str(anchor.get("message_id") or anchor.get("id") or "") != anchor_id
+            ):
+                return "读取失败：未能读取指定原消息，未改用无关的最近图片。"
+            anchor_sender = anchor.get("sender")
+            if not isinstance(anchor_sender, dict):
+                anchor_sender = {}
+            if is_group:
+                belongs_to_target = str(anchor.get("group_id") or "") == resolved_id
+            else:
+                anchor_peer = str(
+                    anchor.get("target_id") or anchor.get("user_id") or ""
+                )
+                if not anchor_peer or anchor_peer == self_id:
+                    anchor_peer = str(anchor_sender.get("user_id") or "")
+                belongs_to_target = (
+                    not anchor.get("group_id") and anchor_peer == resolved_id
+                )
+            if not belongs_to_target:
+                return "读取失败：指定原消息不属于目标会话，未注册其附件。"
+            params["message_seq"] = (
+                anchor.get("message_seq")
+                or anchor.get("real_id")
+                or anchor.get("seq")
+                or int(anchor_id)
+            )
+            try:
+                anchor_time = float(anchor.get("time") or anchor.get("timestamp") or 0)
+            except (TypeError, ValueError):
+                pass
+        params["reverseOrder"] = True
+        history = await self._call_platform_action(
+            platform_id,
+            "get_group_msg_history" if is_group else "get_friend_msg_history",
+            **params,
+            **routing,
+        )
+        history = self._unwrap_onebot_action_payload(history)
+        messages = history.get("messages") if isinstance(history, dict) else history
+        if not isinstance(messages, list):
+            if anchor is None:
+                return "读取失败：平台未返回可读取的原始消息；没有可用原图或文件引用。"
+            messages = []
+            warnings.append("历史分页不可用，仅返回已验证的指定原消息。")
+        if anchor is not None:
+            messages = [*messages, anchor]
+
+        records = []
+        seen_ids = set()
+        for raw in messages:
+            if not isinstance(raw, dict):
+                continue
+            message_id = str(raw.get("message_id") or raw.get("id") or "")
+            if (
+                not message_id
+                or message_id in seen_ids
+                or message_id.startswith("gossip-task-")
+            ):
+                continue
+            if raw.get("group_id") and str(raw["group_id"]) != (
+                resolved_id if is_group else ""
+            ):
+                continue
+            try:
+                timestamp = float(raw.get("time") or raw.get("timestamp") or 0)
+            except (TypeError, ValueError):
+                timestamp = 0.0
+            if anchor is not None and message_id != anchor_id:
+                if not anchor_time or not timestamp or timestamp >= anchor_time:
+                    continue
+            seen_ids.add(message_id)
+            records.append((timestamp, message_id, raw))
+        records.sort(key=lambda record: record[0])
+        records = records[-limit:]
+        if not records:
+            return f"目标会话 {session_id} 未返回可读取的真实消息；未注册任何附件。"
+
+        registry = self._ensure_attachment_registry(event)
+        counters = {
+            kind: max(
+                (
+                    int(ref.rsplit("_", 1)[-1])
+                    for ref in registry
+                    if re.fullmatch(rf"{kind}_\d+", ref)
+                ),
+                default=0,
+            )
+            for kind in ("image", "file")
+        }
+        lines = [
+            f"QQ 原始消息，来源会话: {session_id}",
+            "附件短引用可用于 reply_qq_session_task 或 wake_qq_session_task；只选择与你要找的内容一致的原消息。",
+        ]
+        for timestamp, message_id, raw in records:
+            sender = raw.get("sender")
+            if not isinstance(sender, dict):
+                sender = {}
+            sender_id = str(sender.get("user_id") or raw.get("user_id") or "")
+            sender_name = str(
+                sender.get("card")
+                or sender.get("nickname")
+                or sender_id
+                or "未知发送者"
+            )
+            content = raw.get("message") or raw.get("content") or []
+            if isinstance(content, str):
+                try:
+                    parsed_content = json.loads(content)
+                except ValueError:
+                    parsed_content = None
+                if isinstance(parsed_content, dict | list):
+                    content = parsed_content
+            if isinstance(content, dict):
+                content = (
+                    [content]
+                    if content.get("type")
+                    else content.get("message") or content.get("segments") or []
+                )
+            segments = self._normalize_onebot_content(content)
+            plain_text = self._onebot_content_preview(segments, limit=800)
+            if sender_id == self_id and (
+                "[跨会话行动]" in plain_text or "[跨会话转入]" in plain_text
+            ):
+                continue
+            try:
+                time_text = (
+                    datetime.fromtimestamp(timestamp, timezone.utc).isoformat(
+                        timespec="seconds"
+                    )
+                    if timestamp
+                    else "时间未知"
+                )
+            except (ValueError, OverflowError, OSError):
+                time_text = "时间未知"
+            lines.append(
+                f"- 消息 {message_id}，时间 {time_text}，发送者 {sender_name}({sender_id})"
+            )
+            if plain_text:
+                lines.append(f"  内容: {plain_text}")
+            for segment_index, segment in enumerate(segments):
+                kind = str(segment.get("type") or "").lower()
+                if kind not in {"image", "file"}:
+                    continue
+                existing = next(
+                    (
+                        item
+                        for item in registry.values()
+                        if item.get("kind") == kind
+                        and item.get("source_session") == session_id
+                        and item.get("source_message_id") == message_id
+                        and item.get("source_segment_index") == segment_index
+                    ),
+                    None,
+                )
+                if existing:
+                    lines.append(
+                        f"  附件: {existing['id']}，{'图片' if kind == 'image' else '文件'}，名称 {existing['name']}"
+                    )
+                    continue
+                data = segment.get("data")
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except ValueError:
+                        data = {"url": data}
+                if not isinstance(data, dict):
+                    warnings.append(f"消息 {message_id} 的{kind}附件数据无效。")
+                    continue
+                try:
+                    raw_ref = str(
+                        data.get("original_url")
+                        or data.get("url")
+                        or data.get("file")
+                        or ""
+                    ).strip()
+                    if (
+                        kind == "file"
+                        and not raw_ref.startswith(("http://", "https://"))
+                        and data.get("file_id")
+                    ):
+                        file_params = {"file_id": data["file_id"], **routing}
+                        if is_group:
+                            file_params["group_id"] = int(resolved_id)
+                        file_result = await self._call_platform_action(
+                            platform_id,
+                            "get_group_file_url"
+                            if is_group
+                            else "get_private_file_url",
+                            **file_params,
+                        )
+                        file_result = self._unwrap_onebot_action_payload(file_result)
+                        raw_ref = (
+                            str(file_result.get("url") or "")
+                            if isinstance(file_result, dict)
+                            else ""
+                        )
+                    if kind == "image" and not raw_ref.startswith(
+                        ("http://", "https://", "base64://", "data:")
+                    ):
+                        local_path = (
+                            file_uri_to_path(raw_ref)
+                            if is_file_uri(raw_ref)
+                            else raw_ref
+                        )
+                        if not local_path or not Path(local_path).is_file():
+                            image_result = await self._call_platform_action(
+                                platform_id,
+                                "get_image",
+                                file=str(data.get("file") or raw_ref),
+                                **routing,
+                            )
+                            image_result = self._unwrap_onebot_action_payload(
+                                image_result
+                            )
+                            raw_ref = (
+                                str(
+                                    image_result.get("url")
+                                    or image_result.get("file")
+                                    or image_result.get("path")
+                                    or ""
+                                )
+                                if isinstance(image_result, dict)
+                                else ""
+                            )
+                            if isinstance(image_result, dict) and image_result.get(
+                                "base64"
+                            ):
+                                remote_path = (
+                                    file_uri_to_path(raw_ref)
+                                    if is_file_uri(raw_ref)
+                                    else raw_ref
+                                )
+                                if not raw_ref.startswith(
+                                    ("http://", "https://", "base64://", "data:")
+                                ) and (
+                                    not remote_path or not Path(remote_path).is_file()
+                                ):
+                                    encoded = str(image_result["base64"]).strip()
+                                    raw_ref = (
+                                        encoded
+                                        if encoded.startswith(("base64://", "data:"))
+                                        else f"base64://{encoded}"
+                                    )
+                    is_remote = raw_ref.startswith(("http://", "https://"))
+                    is_encoded = kind == "image" and raw_ref.startswith(
+                        ("base64://", "data:")
+                    )
+                    local_path = (
+                        file_uri_to_path(raw_ref) if is_file_uri(raw_ref) else raw_ref
+                    )
+                    if (
+                        not is_remote
+                        and not is_encoded
+                        and (not local_path or not Path(local_path).is_file())
+                    ):
+                        raise ValueError(
+                            "平台未提供可用原始附件，不能使用文件名或失效临时路径代替"
+                        )
+                    name = str(data.get("name") or data.get("file_name") or "").strip()
+                    native_name = str(data.get("file") or "").strip()
+                    if (
+                        not name
+                        and native_name
+                        and not native_name.startswith(
+                            ("http://", "https://", "file://", "base64://", "data:")
+                        )
+                    ):
+                        name = Path(native_name.replace("\\", "/")).name
+                    if not name:
+                        name = Path(urlparse(raw_ref).path).name if is_remote else ""
+                    latest_registry = event.get_extra(
+                        ATTACHMENT_REGISTRY_EXTRA, registry
+                    )
+                    if isinstance(latest_registry, dict):
+                        registry = latest_registry
+                    existing = next(
+                        (
+                            item
+                            for item in registry.values()
+                            if item.get("kind") == kind
+                            and item.get("source_session") == session_id
+                            and item.get("source_message_id") == message_id
+                            and item.get("source_segment_index") == segment_index
+                        ),
+                        None,
+                    )
+                    if existing:
+                        lines.append(
+                            f"  附件: {existing['id']}，{'图片' if kind == 'image' else '文件'}，名称 {existing['name']}"
+                        )
+                        continue
+                    # Recheck after platform awaits, then allocate and write atomically.
+                    counters[kind] += 1
+                    ref_id = f"{kind}_{counters[kind]}"
+                    while ref_id in registry:
+                        counters[kind] += 1
+                        ref_id = f"{kind}_{counters[kind]}"
+                    name = name or ref_id
+                    component = (
+                        Image(file=raw_ref)
+                        if kind == "image"
+                        else File(name=name, url=raw_ref)
+                        if is_remote
+                        else File(name=name, file=local_path)
+                    )
+                    aliases = {ref_id, name}
+                    if len(raw_ref) <= 2048:
+                        aliases.add(raw_ref)
+                    registry[ref_id] = {
+                        "id": ref_id,
+                        "kind": kind,
+                        "component": component,
+                        "source": f"会话 {session_id} 的原消息 {message_id}",
+                        "name": name,
+                        "raw_ref": raw_ref,
+                        "aliases": aliases,
+                        "source_session": session_id,
+                        "source_message_id": message_id,
+                        "source_segment_index": segment_index,
+                    }
+                    lines.append(
+                        f"  附件: {ref_id}，{'图片' if kind == 'image' else '文件'}，名称 {name}"
+                    )
+                except Exception as error:
+                    warnings.append(f"消息 {message_id} 的{kind}附件读取失败：{error}")
+        event.set_extra(ATTACHMENT_REGISTRY_EXTRA, registry)
+        if warnings:
+            lines.append("读取说明: " + "；".join(dict.fromkeys(warnings)))
+        return "\n".join(lines)
 
     @filter.llm_tool("get_available_groups")
     async def get_groups(self, event: AstrMessageEvent):
@@ -3607,29 +4604,69 @@ class GossipSharer(Star):
         image_refs: list[str] = None,
         file_refs: list[str] = None,
         forward_refs: list[str] = None,
+        return_to_source: bool = False,
     ):
         """
-        将任务委派给指定 QQ 群聊或私聊的目标 LLM。
+        Coordinate across QQ sessions: send a message there, or ask the agent there
+        to read its context, investigate, recover original images/files, and return
+        the results to this conversation.
 
-        这是 Bot 的主动跨会话社交能力，不只是被动转发工具。当当前会话出现值得告诉
-        其他人的趣事、吐槽、告状、请求转达、邀请回应或适合分享的图片、文件和合并聊天记录时，
-        可以结合人设、关系和目标会话语境自主调用，不必等待用户明确要求“转发”。
-        目标 LLM 会读取目标会话上下文，并自行说话、查询成员、At 或调用工具。
-        task 必须写清楚目标会话要完成的事情。只有确实要把内容发过去时，
-        才传入当前提示中列出的 image_refs、file_refs 或 forward_refs；
-        未选择的内容不会自动发送。选中的图片、文件和合并聊天记录会在目标 LLM
-        回复发送完成后投递，图片仍会先提供给目标 LLM 识别。
-        QQ 官方机器人平台会等目标回复发出后再返回；发送失败时会返回 QQ 给出的原因，
-        例如对方没有添加机器人或关闭了主动消息。
+        When this conversation lacks information but another session has the
+        relevant history, proactively delegate to that session. Do not wait for
+        the user to suggest waking it, and do not stop just because this private
+        conversation did not save an image from a group. The target agent can use
+        its own history and tools to gather information you do not currently have.
+
+        For information, original attachments, answers, or feedback requested back
+        here, set return_to_source=True. target_id is WHERE TO INVESTIGATE, while
+        the final recipient is the fixed original requesting conversation. Write
+        task with the subject, sender/time clues, and expected result format. The
+        target agent should verify the source, use get_qq_session_messages for real
+        original attachments, and reply_qq_session_task to send the result back.
+        Example: "Show me the nine-grid image from that group" means delegate to
+        that group with return_to_source=True and return the actual original image,
+        rather than posting it in the group or returning only its description.
+
+        For social sharing, inviting a response, or an action to be performed and
+        announced in the target session, leave return_to_source=False. Select
+        image_refs/file_refs/forward_refs only for actual attachments you already
+        have. In this mode they are sent there after the target's reply. In return
+        mode they are task input only, and the target explicitly selects outputs.
+
+        If you only need known original messages or attachments, you can also use
+        get_qq_session_messages with that group/friend as target, then use
+        reply_qq_session_task to send the selected originals directly here.
+        Resolve uncertain destinations with get_available_groups/get_friend_list.
+        Never wake the current session or re-wake the result recipient to reply.
+        A successful call only SUBMITS a task; it does not prove execution, receipt
+        of information, or attachment delivery. Report actual tool results only.
+        Normal QQ Official shares also wait for the first target reply send;
+        failed sends return the actual QQ error. Return-mode tasks are queued
+        asynchronously and send their actual results through the fixed reply tool.
 
         Args:
-            target_id (str): 目标 QQ 群号或好友 QQ；QQ 官方机器人平台下为 group_openid 或 user_openid，可先用 get_available_groups / get_friend_list 查询。群目标必须在白名单中；私聊目标遵循私聊安全配置。
-            task (str): 目标 LLM 要完成的自然语言行动。
-            target_type (str): 目标会话类型。支持 GroupMessage 和 FriendMessage，默认 GroupMessage。
-            target_platform (str): 可选。平台 ID，必须与当前会话属于同一类 QQ 适配器。默认使用当前会话所在平台。
-            image_refs (list[string]): 可选。要主动发送的图片引用。本轮当前消息或引用消息中的图片必须使用提示提供的 image_1 这类短引用；历史 media_image 临时路径仅在能精确映射到本轮附件时兼容，否则整次唤醒失败。也支持允许路径、URL 或 base64。
-            file_refs (list[string]): 可选。要主动发送的文件短引用、允许路径或 HTTP/HTTPS URL。
-            forward_refs (list[string]): 可选。要发送为原生 QQ 合并聊天记录的来源引用，QQ 官方机器人平台不支持。使用提示中列出的 forward_1（已有合并记录）或 message_1、message_2（零散消息）；多个引用会按顺序整理成一张可展开卡片。
+            target_id (str): Execution-session group/friend QQ, or official group/user
+                openid. Group destinations must be whitelisted; private ones follow
+                the configured private-target policy. This is not the reply address.
+            task (str): Specific work for the target agent: what to find or do,
+                source clues, and whether to return text, original images, or files.
+            target_type (str): Execution type: GroupMessage or FriendMessage. Defaults
+                to GroupMessage; explicitly use FriendMessage for a private target.
+            target_platform (str): Optional platform instance of the same QQ adapter
+                family. Defaults to the current instance or a same-family override.
+            image_refs (list[string]): Optional known image_N refs, allowed paths,
+                URLs or base64. Old media_image paths require an exact current match.
+                Leave empty when the target agent must find its own original images.
+            file_refs (list[string]): Optional known file_N refs, allowed paths or
+                URLs. image_N is also accepted to send the original image as a file.
+            forward_refs (list[string]): Optional forward_N/message_N refs for a
+                native merged card. Available on OneBot, not QQ Official.
+            return_to_source (bool): True to investigate there and return the actual
+                result to the FIRST requesting session, inherited across delegation.
+                False to speak/act/send selected content in the execution session.
+
+        Returns:
+            Task submission status and fixed reply route, or an explicit failure.
         """
         try:
             result = await self._safe_wake_qq_session_task(
@@ -3641,10 +4678,9 @@ class GossipSharer(Star):
                 image_refs=image_refs,
                 file_refs=file_refs,
                 forward_refs=forward_refs,
+                return_to_source=return_to_source,
             )
-            if result.startswith("唤醒失败："):
-                return result
-            return f"目标会话 LLM 已唤醒：{result}"
+            return result
         except Exception as e:
             return f"唤醒失败：{str(e)}"
 
@@ -3691,10 +4727,14 @@ class GossipSharer(Star):
     @filter.on_llm_request()
     async def auto_share_logic(self, event: AstrMessageEvent, req: ProviderRequest):
         if self._event_kind(event) == "official" and req.func_tool:
-            # 官方平台没有群成员接口，本次请求不向 LLM 暴露该工具。
+            # The official adapter has no group-member or message-history API.
             req.func_tool.remove_tool("get_target_group_members")
-        if self._is_synthetic_event(event):
-            return
+            req.func_tool.remove_tool("get_qq_session_messages")
+        if (
+            self._get_delegated_task_payload(event).get("return_to_source")
+            and req.func_tool
+        ):
+            req.func_tool.remove_tool("send_message_to_user")
 
         registry = self._ensure_attachment_registry(event, req.image_urls)
         forward_registry = self._ensure_forward_registry(event)
@@ -3760,6 +4800,9 @@ class GossipSharer(Star):
             req.extra_user_content_parts.append(
                 TextPart(text=forward_catalog).mark_as_temp()
             )
+
+        if self._is_synthetic_event(event):
+            return
 
         if self.guarantee_threshold <= 0:
             return

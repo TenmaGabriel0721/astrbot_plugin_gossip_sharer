@@ -59,19 +59,19 @@
         "type": "bool",
         "default": true,
         "description": "允许 wake 携带图片",
-        "hint": "开启后，Bot 可在 wake_qq_session_task 的 image_refs 中主动选择图片。图片会先提供给目标 LLM 识别，并在目标回复发送完成后投递到 QQ；未选择的图片不会自动发送。"
+        "hint": "开启后，Bot 可通过 image_refs 选择原图。分享任务在目标回复后投递；return_to_source 回传任务中图片先作为资料，由目标通过 reply_qq_session_task 选择结果送回来源。未选择的图片不会自动发送。"
     },
     "enable_wake_files": {
         "type": "bool",
         "default": true,
         "description": "允许 wake 携带文件",
-        "hint": "开启后，Bot 可在 wake_qq_session_task 的 file_refs 中主动选择文件。文件会生成一次性临时快照，在目标回复发送完成后投递；目标 LLM 会提前获得文件名、类型、大小和待投递状态。"
+        "hint": "开启后，Bot 可通过 file_refs 选择文件或把 image_N 原图作为文件发送。文件使用独立快照；分享任务在目标回复后投递，回传任务通过 reply_qq_session_task 送回来源，保留原文件名、类型和大小。"
     },
     "enable_wake_forwards": {
         "type": "bool",
         "default": true,
         "description": "允许 wake 携带合并聊天记录",
-        "hint": "开启后，Bot 可在 wake_qq_session_task 的 forward_refs 或 forward_items 中选择、整理 QQ 原生合并聊天记录。目标 LLM 回复完成后才投递可展开卡片；关闭后相关参数会被拒绝。仅 OneBot 平台可用，QQ 官方机器人不支持合并转发。",
+        "hint": "开启后，Bot 可通过 forward_refs 选择、整理 QQ 原生合并聊天记录。分享任务在目标回复后投递；回传任务通过 reply_qq_session_task 发送结果。关闭后相关参数被拒绝。仅 OneBot 平台可用，QQ 官方机器人不支持合并转发。",
         "obvious_hint": true
     },
     "allow_remote_attachment_urls": {
@@ -103,19 +103,19 @@
         "type": "int",
         "default": 50,
         "description": "合并记录节点上限",
-        "hint": "一张合并聊天记录最多包含多少个节点。超过上限时不会发送该合并记录，文字任务仍会继续。"
+        "hint": "一张合并聊天记录最多包含多少个节点。超过上限时本次提交或回传失败，不以纯文字替代附件。"
     },
     "max_wake_image_mb": {
         "type": "int",
         "default": 15,
         "description": "单张图片上限（MB）",
-        "hint": "超过此大小的图片不会发送，但文字任务仍会继续唤醒目标 LLM。"
+        "hint": "单张图片超过此大小时本次提交或回传失败，不以纯文字替代附件。"
     },
     "max_wake_file_mb": {
         "type": "int",
         "default": 50,
         "description": "单个文件上限（MB）",
-        "hint": "超过此大小的文件不会发送，但文字任务仍会继续唤醒目标 LLM。"
+        "hint": "单个文件超过此大小时本次提交或回传失败，不以纯文字替代附件。"
     },
     "max_wake_total_mb": {
         "type": "int",
