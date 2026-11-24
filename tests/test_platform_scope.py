@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 PLUGIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
 METHOD_NAMES = {
@@ -16,6 +17,8 @@ METHOD_NAMES = {
     "_effective_target_platform_id",
     "_target_policy",
     "_validate_target",
+    "_config_group_whitelist",
+    "_load_group_whitelist",
     "_official_session",
     "_attach_official_raw_message",
     "_track_official_delivery",
@@ -44,8 +47,7 @@ constants = [
     if isinstance(node, ast.Assign)
     and any(
         isinstance(target, ast.Name)
-        and target.id
-        in {"ONEBOT_ADAPTERS", "OFFICIAL_ADAPTERS"}
+        and target.id in {"ONEBOT_ADAPTERS", "OFFICIAL_ADAPTERS"}
         for target in node.targets
     )
 ]
@@ -172,9 +174,53 @@ class TargetPolicyTests(unittest.TestCase):
         self.assertIsNotNone(
             self.plugin._validate_target("GroupMessage", "GROUPOPENID", "napcat")
         )
-        self.assertIsNone(self.plugin._validate_target("GroupMessage", "123456", "napcat"))
+        self.assertIsNone(
+            self.plugin._validate_target("GroupMessage", "123456", "napcat")
+        )
         self.assertIsNotNone(
             self.plugin._validate_target("GroupMessage", "123456", "official")
+        )
+
+    def test_empty_group_lists_allow_both_adapters(self):
+        self.plugin.group_whitelist = []
+        self.plugin.official_group_whitelist = []
+        for platform, target in (("napcat", "999999"), ("official", "OTHEROPENID")):
+            with self.subTest(platform=platform):
+                self.assertIsNone(
+                    self.plugin._validate_target("GroupMessage", target, platform)
+                )
+        self.assertIsNotNone(
+            self.plugin._validate_target("GroupMessage", "", "official")
+        )
+        self.assertIsNotNone(
+            self.plugin._validate_target("OtherMessage", "OTHEROPENID", "official")
+        )
+
+    def test_empty_list_does_not_relax_the_other_adapters_list(self):
+        self.plugin.official_group_whitelist = []
+        self.assertIsNone(
+            self.plugin._validate_target("GroupMessage", "OTHEROPENID", "official")
+        )
+        self.assertIsNotNone(
+            self.plugin._validate_target("GroupMessage", "999999", "napcat")
+        )
+        self.plugin.group_whitelist = []
+        self.plugin.official_group_whitelist = ["GROUPOPENID"]
+        self.assertIsNone(
+            self.plugin._validate_target("GroupMessage", "999999", "napcat")
+        )
+        self.assertIsNotNone(
+            self.plugin._validate_target("GroupMessage", "OTHEROPENID", "official")
+        )
+
+    def test_empty_group_lists_preserve_private_restrictions(self):
+        self.plugin.group_whitelist = []
+        self.plugin.official_group_whitelist = []
+        self.assertIsNotNone(
+            self.plugin._validate_target("FriendMessage", "20002", "napcat")
+        )
+        self.assertIsNotNone(
+            self.plugin._validate_target("FriendMessage", "OTHERUSER", "official")
         )
 
     def test_private_targets_follow_adapter_sister(self):
@@ -183,7 +229,9 @@ class TargetPolicyTests(unittest.TestCase):
         )
         error = self.plugin._validate_target("FriendMessage", "10001", "official")
         self.assertIn("official_sister_openid", error)
-        self.assertIsNone(self.plugin._validate_target("FriendMessage", "10001", "napcat"))
+        self.assertIsNone(
+            self.plugin._validate_target("FriendMessage", "10001", "napcat")
+        )
 
     def test_arbitrary_private_targets_do_not_need_sister(self):
         self.plugin.official_sister_openid = ""
@@ -191,7 +239,37 @@ class TargetPolicyTests(unittest.TestCase):
             self.plugin._validate_target("FriendMessage", "U1", "official")
         )
         self.plugin.enable_arbitrary_friend_targets = True
-        self.assertIsNone(self.plugin._validate_target("FriendMessage", "U1", "official"))
+        self.assertIsNone(
+            self.plugin._validate_target("FriendMessage", "U1", "official")
+        )
+
+
+class GroupWhitelistLoadingTests(unittest.TestCase):
+    def test_raw_empty_setting_ignores_soft_whitelist_groups(self):
+        for raw_groups in (None, [], ["", " "]):
+            with self.subTest(raw_groups=raw_groups):
+                plugin = _make_plugin()
+                plugin.config = (
+                    {} if raw_groups is None else {"group_whitelist": raw_groups}
+                )
+                plugin._load_soft_whitelist_groups = Mock(return_value=["123456"])
+
+                GossipSharer._load_group_whitelist(plugin)
+
+                self.assertEqual(plugin.group_whitelist, [])
+                plugin._load_soft_whitelist_groups.assert_not_called()
+
+    def test_nonempty_setting_merges_and_deduplicates_soft_groups(self):
+        plugin = _make_plugin()
+        plugin.config = {"group_whitelist": ["123456", " 789012 ", ""]}
+        plugin._load_soft_whitelist_groups = Mock(
+            return_value=["654321", "123456", "654321"]
+        )
+
+        GossipSharer._load_group_whitelist(plugin)
+
+        self.assertEqual(plugin.group_whitelist, ["654321", "123456", "789012"])
+        plugin._load_soft_whitelist_groups.assert_called_once_with()
 
 
 class OfficialRawMessageTests(unittest.TestCase):
@@ -200,7 +278,9 @@ class OfficialRawMessageTests(unittest.TestCase):
         self.platform = _FakePlatform("official", "qq_official")
 
     def _message(self):
-        return SimpleNamespace(message_id="gossip-task-x", message_str="任务", raw_message=None)
+        return SimpleNamespace(
+            message_id="gossip-task-x", message_str="任务", raw_message=None
+        )
 
     def test_group_target_keeps_synthetic_id_for_proactive_fallback(self):
         message = self._message()
@@ -249,6 +329,7 @@ class OfficialDeliveryTests(unittest.TestCase):
             raise RuntimeError("用户已关闭主动消息")
 
         self.assertEqual(str(self._deliver(post_send)), "用户已关闭主动消息")
+
 
 if __name__ == "__main__":
     unittest.main()

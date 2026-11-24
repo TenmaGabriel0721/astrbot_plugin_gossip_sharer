@@ -23,8 +23,8 @@
             "type": "string"
         },
         "default": [],
-        "description": "OneBot 额外群白名单",
-        "hint": "OneBot(aiocqhttp) 平台允许跨会话发送和唤醒的 QQ 群号。这里的群号会与 soft_whitelist 插件的 group_whitelist 自动合并并去重。"
+        "description": "OneBot 群白名单",
+        "hint": "留空时，本插件允许向所有 OneBot QQ 群跨会话发送和唤醒，不读取 soft_whitelist 的群限制。填写后仅允许所填群号及 soft_whitelist 插件群白名单中的群，两个来源自动合并去重。"
     },
     "official_sister_openid": {
         "type": "string",
@@ -39,7 +39,7 @@
         },
         "default": [],
         "description": "QQ 官方机器人群白名单",
-        "hint": "QQ 官方机器人平台允许跨会话唤醒的群 group_openid（可在群里发送 /sid 查看会话 ID 最后一段）。与 OneBot 群白名单相互独立，不读取 soft_whitelist。"
+        "hint": "留空允许向所有 QQ 官方机器人群跨会话发送和唤醒；填写后仅允许列出的 group_openid（可在群里发送 /sid 查看会话 ID 最后一段）。与 OneBot 群白名单相互独立，不读取 soft_whitelist。"
     },
     "enable_arbitrary_friend_targets": {
         "type": "bool",

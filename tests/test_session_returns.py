@@ -343,6 +343,36 @@ async def _return_task_event(plugin):
 
 
 class WakeReturnRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_group_lists_do_not_allow_cross_adapter_wake(self):
+        for source_id, adapter, target_platform, target_id in (
+            ("napcat", "aiocqhttp", "official", "GROUPOPENID"),
+            ("official", "qq_official", "napcat", "123456"),
+        ):
+            with self.subTest(source=source_id, target=target_platform):
+                plugin = _make_plugin()
+                plugin.group_whitelist = []
+                plugin.official_group_whitelist = []
+                event = _Event(platform_id=source_id, adapter=adapter)
+
+                result = await plugin._safe_wake_qq_session_task(
+                    event,
+                    target_id=target_id,
+                    target_type="GroupMessage",
+                    target_platform=target_platform,
+                    task="检查跨适配器唤醒限制",
+                )
+
+                self.assertIn("唤醒失败", result)
+                self.assertIn("不是同一类 QQ 适配器", result)
+                self.assertTrue(
+                    all(
+                        not platform.committed
+                        for platform in plugin.context.platform_manager.platform_insts
+                    )
+                )
+                plugin._prepare_wake_attachments.assert_not_awaited()
+                plugin.context.send_message.assert_not_awaited()
+
     async def test_nested_wakes_keep_original_private_return_route(self):
         plugin = _make_plugin()
         source = _Event()

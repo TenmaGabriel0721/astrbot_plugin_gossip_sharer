@@ -30,13 +30,14 @@ from astrbot.api.platform import AstrBotMessage, Group, MessageMember, MessageTy
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.message import TextPart
+from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import (
     get_astrbot_temp_path,
     get_astrbot_workspaces_path,
 )
 from astrbot.core.utils.media_utils import file_uri_to_path, is_file_uri
 
-PLUGIN_VERSION = "2.0.1"
+PLUGIN_VERSION = "2.0.4"
 SYNTHETIC_EVENT_EXTRA = "gossip_sharer_synthetic_event"
 DELEGATED_TASK_EXTRA = "gossip_sharer_delegated_target_task"
 ATTACHMENT_REGISTRY_EXTRA = "gossip_sharer_attachment_registry"
@@ -139,7 +140,7 @@ class GossipSharer(Star):
         self._wake_signature_lock = asyncio.Lock()
         self._inflight_wake_signatures: set[str] = set()
         self._recent_wake_signatures: dict[str, float] = {}
-        # QQ 官方接口拿不到群/好友列表，按会话记录运行期间见过的群和私聊。
+        # Merge saved AstrBot sessions with QQ Official targets seen at runtime.
         self._official_sessions: dict[str, dict] = {}
 
         if not self.sister_qq:
@@ -202,7 +203,13 @@ class GossipSharer(Star):
         return groups
 
     def _load_group_whitelist(self):
-        groups = self._load_soft_whitelist_groups() + self._config_group_whitelist()
+        configured_groups = self._config_group_whitelist()
+        if not configured_groups:
+            # An empty plugin setting disables group restrictions, including
+            # inherited soft-whitelist restrictions for cross-session actions.
+            self.group_whitelist = []
+            return
+        groups = self._load_soft_whitelist_groups() + configured_groups
         self.group_whitelist = list(dict.fromkeys(groups))
 
     def _event_key(self, event: AstrMessageEvent | None) -> str:
@@ -383,7 +390,11 @@ class GossipSharer(Star):
         group_whitelist, sister_id, sister_key = self._target_policy(
             self._platform_kind(self._get_platform_by_id(platform_id))
         )
-        if target_type == "GroupMessage" and str(target_id) not in group_whitelist:
+        if (
+            target_type == "GroupMessage"
+            and group_whitelist
+            and str(target_id) not in group_whitelist
+        ):
             return f"发送失败：群 {target_id} 不在白名单里。"
         if target_type == "FriendMessage":
             if not sister_id and not self.enable_arbitrary_friend_targets:
@@ -2874,7 +2885,13 @@ class GossipSharer(Star):
                     or item.get("name")
                     or "未知群名"
                 )
-                status = " [白名单可转发]" if str(gid) in whitelist_set else ""
+                status = (
+                    " [可转发]"
+                    if not whitelist_set
+                    else " [白名单可转发]"
+                    if str(gid) in whitelist_set
+                    else ""
+                )
                 lines.append(f"- {group_name} ({gid}){status}")
             else:
                 lines.append(f"- {str(item)}")
@@ -3012,8 +3029,102 @@ class GossipSharer(Star):
                 "name": "",
                 "name_checked": False,
                 "last_active": 0.0,
+                "history_updated": 0.0,
+                "has_history": False,
             },
         )
+
+    async def _sync_official_sessions(self, event: AstrMessageEvent) -> None:
+        """Merge saved QQ group/C2C session metadata into the known targets.
+
+        Args:
+            event: Source event identifying the exact QQ Official bot instance.
+        """
+        platform_id = event.get_platform_id()
+        conv_mgr = getattr(self.context, "conversation_manager", None)
+        if conv_mgr is None:
+            return
+
+        try:
+            getter = getattr(conv_mgr, "get_filtered_conversations", None)
+            if callable(getter):
+                conversations = []
+                page, page_size = 1, 100
+                while True:
+                    batch, total = await getter(
+                        page=page,
+                        page_size=page_size,
+                        platform_ids=[platform_id],
+                        include_history=False,
+                        group_by_session=True,
+                        sort_by="updated_at",
+                    )
+                    conversations.extend(batch)
+                    # Grouped pages may contain several conversations per UMO.
+                    if not batch or page * page_size >= total:
+                        break
+                    page += 1
+            else:
+                getter = getattr(conv_mgr, "get_conversations", None)
+                if not callable(getter):
+                    return
+                conversations = await getter(platform_id=platform_id)
+        except Exception as error:
+            logger.warning(
+                "Failed to load saved QQ Official sessions for platform %s: %s",
+                platform_id,
+                error,
+            )
+            return
+
+        umo_records = {}
+        for conversation in conversations:
+            try:
+                session = MessageSession.from_str(conversation.user_id)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if (
+                conversation.platform_id != platform_id
+                or session.platform_id != platform_id
+                or session.message_type
+                not in {MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE}
+            ):
+                continue
+            target_id = session.session_id
+            if session.message_type == MessageType.GROUP_MESSAGE:
+                target_id = target_id.rsplit("_", 1)[-1]
+            # Guild channels/DMs also use these message types, but numeric IDs
+            # are not QQ group or C2C OpenIDs.
+            if target_id.isdecimal() or not re.fullmatch(r"[0-9A-Fa-f]{32}", target_id):
+                continue
+            record = self._official_session(
+                platform_id, session.message_type.value, target_id
+            )
+            record["has_history"] = True
+            # A conversation update is not a newly received QQ message.
+            record["history_updated"] = max(
+                record.get("history_updated", 0.0),
+                float(conversation.updated_at or conversation.created_at or 0),
+            )
+            umo_records[conversation.user_id] = record
+
+        alias_getter = getattr(getattr(conv_mgr, "db", None), "get_umo_aliases", None)
+        if not umo_records or not callable(alias_getter):
+            return
+        try:
+            aliases = await alias_getter(umos=list(umo_records))
+            alias_map = {alias.umo: alias for alias in aliases}
+        except Exception as error:
+            logger.debug("Failed to load saved QQ Official session names: %s", error)
+            return
+        for umo, record in umo_records.items():
+            alias = alias_map.get(umo)
+            if alias is not None and not record["name"]:
+                # Dialogue titles describe the conversation, not the contact.
+                record["name"] = (
+                    str(alias.user_alias or "").strip()
+                    or str(alias.auto_name or "").strip()
+                )
 
     async def _ensure_official_group_name(self, client, record: dict) -> None:
         """Fill a group name via ``GET /v2/groups/{group_openid}/info`` once per run."""
@@ -3050,8 +3161,14 @@ class GossipSharer(Star):
         return f"{seconds // 3600} 小时前活跃"
 
     async def _format_official_groups(self, event: AstrMessageEvent) -> str:
+        await self._sync_official_sessions(event)
         platform_id = event.get_platform_id()
         whitelist = set(self.official_group_whitelist)
+        policy_tip = (
+            "当前仅允许群白名单内的群跨会话转发和唤醒。"
+            if whitelist
+            else "当前群白名单为空，允许所有群。"
+        )
         for group_id in self.official_group_whitelist:
             self._official_session(platform_id, "GroupMessage", group_id)
         records = [
@@ -3060,27 +3177,44 @@ class GossipSharer(Star):
             if record["platform"] == platform_id and record["type"] == "GroupMessage"
         ]
         if not records:
-            return "QQ 官方机器人当前没有白名单群，本次运行也还没收到过群消息。"
+            return "QQ 官方机器人暂未发现已知群聊。" + policy_tip
 
         lines = [
-            "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为白名单群和本次运行中收到过消息的群；"
-            "target_id 填 group_openid）："
+            "QQ 官方机器人可感知到的群（官方接口不提供群列表，以下为 AstrBot 历史会话、白名单群和本次运行中收到过消息的群；"
+            "target_id 填 group_openid）：",
+            policy_tip,
         ]
-        records = sorted(records, key=lambda item: item["last_active"], reverse=True)[
-            :50
-        ]
+        records.sort(
+            key=lambda item: max(item["last_active"], item.get("history_updated", 0.0)),
+            reverse=True,
+        )
+        total = len(records)
+        records = records[:50]
         await asyncio.gather(
             *(self._ensure_official_group_name(event.bot, record) for record in records)
         )
         for record in records:
-            status = " [白名单可转发]" if record["id"] in whitelist else ""
-            lines.append(
-                f"- {record['name'] or '未知群名'} ({record['id']}){status}，"
-                f"{self._format_elapsed(record['last_active'])}"
+            status = (
+                " [可转发]"
+                if not whitelist
+                else " [白名单可转发]"
+                if record["id"] in whitelist
+                else ""
             )
+            activity = (
+                self._format_elapsed(record["last_active"])
+                if record["last_active"] or not record.get("has_history")
+                else "已有历史会话"
+            )
+            lines.append(
+                f"- {record['name'] or '未知群名'} ({record['id']}){status}，{activity}"
+            )
+        if total > 50:
+            lines.append(f"仅展示前 50 项，共 {total} 个群。")
         return "\n".join(lines)
 
-    def _format_official_friends(self, event: AstrMessageEvent) -> str:
+    async def _format_official_friends(self, event: AstrMessageEvent) -> str:
+        await self._sync_official_sessions(event)
         platform_id = event.get_platform_id()
         if self.official_sister_openid:
             self._official_session(
@@ -3092,13 +3226,16 @@ class GossipSharer(Star):
             if record["platform"] == platform_id and record["type"] == "FriendMessage"
         ]
         if not records:
-            return "QQ 官方机器人未配置 official_sister_openid，本次运行也还没收到过私聊消息。"
+            return "QQ 官方机器人未配置 official_sister_openid，也没有已保存的私聊会话或本次运行的私聊消息记录。"
 
         lines = [
-            "QQ 官方机器人可感知到的私聊对象（官方接口不提供好友列表，以下为默认私聊对象和本次运行中私聊过的用户；"
+            "QQ 官方机器人可感知到的私聊对象（官方接口不提供好友列表，以下为 AstrBot 历史会话、默认私聊对象和本次运行中私聊过的用户；"
             "target_id 填 user_openid）："
         ]
-        records.sort(key=lambda item: item["last_active"], reverse=True)
+        records.sort(
+            key=lambda item: max(item["last_active"], item.get("history_updated", 0.0)),
+            reverse=True,
+        )
         for record in records[:50]:
             if record["id"] == self.official_sister_openid:
                 mark = f" [{self.sister_title}/默认可转发]"
@@ -3106,19 +3243,25 @@ class GossipSharer(Star):
                 mark = " [可转发]"
             else:
                 mark = ""
-            lines.append(
-                f"- {record['name'] or '未知昵称'} ({record['id']}){mark}，"
-                f"{self._format_elapsed(record['last_active'])}"
+            activity = (
+                self._format_elapsed(record["last_active"])
+                if record["last_active"] or not record.get("has_history")
+                else "已有历史会话"
             )
+            lines.append(
+                f"- {record['name'] or '未知昵称'} ({record['id']}){mark}，{activity}"
+            )
+        if len(records) > 50:
+            lines.append(f"仅展示前 50 项，共 {len(records)} 个私聊对象。")
         return "\n".join(lines)
 
     def _build_guarantee_prompt(self, count: int, kind: str) -> str:
         _, sister_id, _ = self._target_policy(kind)
         target_hint = (
             f"你可以优先考虑联系{self.sister_title}({sister_id})的私聊会话，"
-            "也可以选择与内容和关系更匹配的白名单群或允许的好友会话。"
+            "也可以选择与内容和关系更匹配、允许转发的群聊或好友会话。"
             if sister_id
-            else "请选择与内容和关系匹配的白名单群或允许的好友会话。"
+            else "请选择与内容和关系匹配、允许转发的群聊或好友会话。"
         )
         forward_hint = (
             ""
@@ -4444,20 +4587,25 @@ class GossipSharer(Star):
 
     @filter.llm_tool("get_available_groups")
     async def get_groups(self, event: AstrMessageEvent):
-        """
-        获取 Bot 当前可感知到的群聊列表，并标注哪些群在白名单中可用于转发。
+        """List known groups and whether cross-session actions are allowed.
+
+        An empty group whitelist allows all group destinations.
+
+        Returns:
+            Known groups with the current group whitelist policy.
         """
         try:
             event = self._unwrap_message_event(event)
             if self._event_kind(event) == "official":
                 return await self._format_official_groups(event)
+            self._load_group_whitelist()
             group_data = await self._try_get_group_list(event)
             formatted = self._format_group_list(group_data)
 
             whitelist_tip = (
                 f"\n当前群白名单：{', '.join(self.group_whitelist)}"
                 if self.group_whitelist
-                else "\n当前没有任何群聊白名单。"
+                else "\n当前群白名单为空，允许所有群。"
             )
 
             if formatted:
@@ -4468,7 +4616,7 @@ class GossipSharer(Star):
                     "当前平台暂未提供可读取的群列表接口。"
                     f"不过已配置的可转发群白名单为：{', '.join(self.group_whitelist)}"
                 )
-            return "当前平台暂未提供可读取的群列表接口，且目前没有任何群聊白名单。"
+            return "当前平台暂未提供可读取的群列表接口。当前群白名单为空，允许所有群。"
         except Exception as e:
             return f"获取群列表失败：{e}"
 
@@ -4480,7 +4628,7 @@ class GossipSharer(Star):
         try:
             event = self._unwrap_message_event(event)
             if self._event_kind(event) == "official":
-                return self._format_official_friends(event)
+                return await self._format_official_friends(event)
             friend_data = await self._try_get_friend_list(event)
             formatted = self._format_friend_list(friend_data)
             if formatted:
@@ -4507,7 +4655,8 @@ class GossipSharer(Star):
         获取目标群聊成员列表，用于转发消息前确认应该 at 哪些目标会话成员。
 
         Args:
-            target_id (str): 目标群号。该群必须在群白名单中。
+            target_id (str): Target group ID. An empty group whitelist allows any
+                group; otherwise the target must be in the whitelist.
             target_platform (str): 可选。平台 ID。默认使用配置值 default_platform。
             keyword (str): 可选。按 QQ、群名片或昵称过滤成员。
             limit (int): 可选。最多展示多少名成员，默认 50，最大 200。
@@ -4646,8 +4795,10 @@ class GossipSharer(Star):
 
         Args:
             target_id (str): Execution-session group/friend QQ, or official group/user
-                openid. Group destinations must be whitelisted; private ones follow
-                the configured private-target policy. This is not the reply address.
+                openid. An empty group whitelist allows all groups; a configured
+                whitelist restricts group destinations to its entries. Private ones
+                follow the configured private-target policy. This is not the reply
+                address.
             task (str): Specific work for the target agent: what to find or do,
                 source clues, and whether to return text, original images, or files.
             target_type (str): Execution type: GroupMessage or FriendMessage. Defaults
